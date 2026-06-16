@@ -1,0 +1,26 @@
+# Docker
+wechat-companion/data/
+wechat-companion/uploads/
+wechat-companion/stickers/
+wechat-companion/dist/
+wechat-companion/node_modules/
+wechat-companion/dashboard/node_modules/
+
+# Hermes
+hermes/weixin/stickers/
+hermes/memories/chat_history.db
+
+# IDE
+.vscode/
+.idea/
+*.pyc
+__pycache__/
+
+# Env
+.env
+*.env
+!hermes/config/.env.template
+
+# OS
+.DS_Store
+Thumbs.db
