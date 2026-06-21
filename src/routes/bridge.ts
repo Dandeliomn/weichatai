@@ -406,8 +406,8 @@ router.put('/bridge/bots/:id/character', authenticate, async (req: Request, res:
     }
 
     await pgPool.query(
-      'UPDATE bot_accounts SET character_id = $1 WHERE id = $2',
-      [character_id, botId]
+      'UPDATE bot_accounts SET character_id = $1, linked_user_id = COALESCE(linked_user_id, $2) WHERE id = $3',
+      [character_id, currentUserId, botId]
     );
 
     // 同步 user_characters

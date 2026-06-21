@@ -38,6 +38,7 @@ export default function BridgePage() {
   const [qrTs, setQrTs] = useState(Date.now());
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const notifiedRef = useRef(false);
+  const prevBotIds = useRef<Set<number>>(new Set());
 
   // 加载可用角色列表
   const loadCharacters = async () => {
@@ -53,6 +54,19 @@ export default function BridgePage() {
       const { data } = await api.get('/bridge/bots');
       const newBots: BotInfo[] = data?.bots || [];
       setBots(newBots);
+
+      // 检测新 Bot：自动绑定选中的角色
+      const currentIds = new Set(newBots.map(b => b.id));
+      if (selectedCharId) {
+        for (const bot of newBots) {
+          if (!prevBotIds.current.has(bot.id) && !bot.character) {
+            prevBotIds.current.add(bot.id); // 先标记，防止 handleChangeChar → fetchBots 死循环
+            handleChangeChar(bot.id, selectedCharId);
+          }
+        }
+      }
+      prevBotIds.current = currentIds; // 清理已删除的 bot
+
       if (newBots.some(b => b.is_active) && !notifiedRef.current) {
         notifiedRef.current = true;
         setShowAddPanel(false);
