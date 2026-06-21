@@ -52,7 +52,7 @@ services:
       - .env
     environment:
       - NODE_ENV=production
-      - ILINK_POLLING_ENABLED=false
+      - ILINK_POLLING_ENABLED=true
     volumes:
       - api_data:/app/data
       - uploads_data:/app/uploads
@@ -89,7 +89,7 @@ services:
       - .env
     environment:
       - NODE_ENV=production
-      - ILINK_POLLING_ENABLED=false
+      - ILINK_POLLING_ENABLED=true
     volumes:
       - uploads_data:/app/uploads
       - ./stickers:/app/stickers
@@ -184,6 +184,8 @@ services:
       - ./scripts/init-db-v2.sql:/docker-entrypoint-initdb.d/02-init-v2.sql:ro
       - ./scripts/init-db-v3.sql:/docker-entrypoint-initdb.d/03-init-v3.sql:ro
       - ./scripts/init-db-v4.sql:/docker-entrypoint-initdb.d/04-init-v4.sql:ro
+      - ./scripts/init-db-v5.sql:/docker-entrypoint-initdb.d/05-init-v5.sql:ro
+      - ./scripts/init-db-v6.sql:/docker-entrypoint-initdb.d/06-init-v6.sql:ro
     restart: unless-stopped
     networks:
       - companion-net
