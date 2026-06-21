@@ -175,16 +175,62 @@ router.get('/bridge/bot-token', async (req: Request, res: Response) => {
 });
 
 /** 获取 WeClaw 桥接的多个 Bot 列表 (公开接口，用于前端检测连接状态) */
-router.get('/bridge/bots', async (_req: Request, res: Response) => {
+/**
+ * GET /api/bridge/bots
+ * 返回 Bot 列表。普通用户只看自己的；管理员看全部。
+ * 新增返回 character 信息。
+ */
+router.get('/bridge/bots', authenticate, async (req: Request, res: Response) => {
   try {
-    // 自动从 OpeniLink 同步 Bot 列表
     await syncOpeniLinkBots().catch(() => {});
 
-    const result = await pgPool.query(
-      'SELECT id, bot_id, wechat_id, nickname, bot_index, is_active, last_active_at FROM bot_accounts WHERE deleted_at IS NULL ORDER BY bot_index'
-    );
-    const connected = result.rows.some((r: any) => r.is_active);
-    res.json({ bots: result.rows, total: result.rows.length, connected });
+    const currentUserId = (req as any).user?.id;
+    const isAdmin = (req as any).user?.role === 'admin';
+
+    let query: string;
+    let params: any[];
+
+    if (isAdmin) {
+      query = `SELECT b.id, b.bot_id, b.wechat_id, b.nickname, b.bot_index,
+                      b.is_active, b.last_active_at, b.created_at,
+                      b.character_id, b.linked_user_id,
+                      ct.name AS character_name, ct.tagline AS character_tagline
+               FROM bot_accounts b
+               LEFT JOIN character_templates ct ON b.character_id = ct.id
+               WHERE b.deleted_at IS NULL
+               ORDER BY b.bot_index`;
+      params = [];
+    } else {
+      query = `SELECT b.id, b.bot_id, b.wechat_id, b.nickname, b.bot_index,
+                      b.is_active, b.last_active_at, b.created_at,
+                      b.character_id, b.linked_user_id,
+                      ct.name AS character_name, ct.tagline AS character_tagline
+               FROM bot_accounts b
+               LEFT JOIN character_templates ct ON b.character_id = ct.id
+               WHERE b.deleted_at IS NULL AND b.linked_user_id = $1
+               ORDER BY b.bot_index`;
+      params = [currentUserId];
+    }
+
+    const result = await pgPool.query(query, params);
+    const bots = result.rows.map((r: any) => ({
+      id: r.id,
+      bot_id: r.bot_id,
+      wechat_id: r.wechat_id,
+      nickname: r.nickname,
+      bot_index: r.bot_index,
+      is_active: r.is_active,
+      last_active_at: r.last_active_at,
+      created_at: r.created_at,
+      character: r.character_id ? {
+        id: r.character_id,
+        name: r.character_name,
+        tagline: r.character_tagline,
+      } : null,
+    }));
+
+    const connected = bots.some((b: any) => b.is_active);
+    res.json({ bots, total: bots.length, connected });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
