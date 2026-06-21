@@ -351,6 +351,22 @@ router.delete('/bridge/bots/:id', authenticate, async (req: Request, res: Respon
     // weclaw-bridge 的 bot_registrar 会自动检测到删除并断开 session
     // 不需要从 api-server 直接操作 weclaw-bridge
 
+    // 同时从 OpeniLink Hub 删除 Bot（防止 sync 加回来）
+    if (permanent) {
+      try {
+        const oiSession = await ensureBridgeSession();
+        if (oiSession) {
+          await axios.delete(`http://openilink-hub:9800/api/bots/${encodeURIComponent(botIdStr)}`, {
+            headers: { Cookie: oiSession },
+            timeout: 5000,
+          });
+          console.log(`[Bot] 🔌 已从 OpeniLink 删除: ${botIdStr}`);
+        }
+      } catch (e: any) {
+        console.warn(`[Bot] OpeniLink 删除失败 (可能已不存在): ${e.message}`);
+      }
+    }
+
     res.json({ ok: true, message: permanent ? 'Bot 已删除' : 'Bot 已停用', botId: botIdStr });
   } catch (error: any) {
     console.error('[Bot] 删除失败:', error.message);
@@ -544,6 +560,20 @@ async function syncOpeniLinkBots(): Promise<void> {
     for (const bot of bots) {
       const botId = bot.id || bot.bot_id || bot.wechat_id;
       if (!botId) continue;
+
+      // 检查是否已被删除: 同时按 bot_id 和 wechat_id 查
+      const deleted = await pgPool.query(
+        `SELECT id FROM bot_accounts
+         WHERE deleted_at IS NOT NULL
+           AND (bot_id = $1 OR wechat_id = $2)
+         LIMIT 1`,
+        [botId, botId]
+      );
+      if (deleted.rows.length > 0) {
+        // 已被用户删除，跳过
+        continue;
+      }
+
       // 写入 bot_accounts (如果不存在)
       await pgPool.query(
         `INSERT INTO bot_accounts (bot_id, api_token, wechat_id, nickname, is_active)
