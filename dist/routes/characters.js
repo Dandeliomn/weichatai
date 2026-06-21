@@ -270,6 +270,26 @@ router.post('/:id/activate', async (req, res) => {
         // 更新使用次数
         await pgPool.query('UPDATE character_templates SET use_count = use_count + 1 WHERE id = $1', [charId]);
         console.log(`[Character] 激活角色: ${char.rows[0].name} (userId=${req.user.userId})`);
+        // 同步到 Hermes (如果存在对应的 ex-skill)
+        try {
+            const charName = char.rows[0].name;
+            const { execSync } = require('child_process');
+            const personaList = execSync('python3 /home/dandelion/.hermes/scripts/persona_manager.py list', {
+                encoding: 'utf-8', timeout: 5000,
+            });
+            // 按名称匹配 ex-skill slug
+            const match = personaList.match(new RegExp(`\\(([^)]+)\\)\\s*\\n.*${charName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+            if (match) {
+                const slug = match[1];
+                execSync(`python3 /home/dandelion/.hermes/scripts/persona_manager.py switch ${slug} --keep-memory`, {
+                    timeout: 15000,
+                });
+                console.log(`[Character] Hermes已同步切换: ${slug}`);
+            }
+        }
+        catch (e) {
+            console.warn(`[Character] Hermes同步跳过: ${e.message}`);
+        }
         res.json({ userCharacter: result.rows[0], message: `已激活角色: ${char.rows[0].name}` });
     }
     catch (err) {

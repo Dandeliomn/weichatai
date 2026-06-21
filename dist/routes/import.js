@@ -485,53 +485,66 @@ router.get('/analysis/:id', async (req, res) => {
                     ? `\n重要："${metaAiName}" 很可能是对话的另一方（非用户本人），请将其作为aiName。`
                     : '';
             const axios = require('axios');
-            const resp = await axios.post(`${process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'}/v1/chat/completions`, {
+            const fs = require('fs');
+            const path = require('path');
+            // 读取 ex-skill 分析模板
+            const skillPromptsDir = path.resolve('/home/dandelion/.hermes/skills/create-ex/prompts');
+            const memoryAnalyzer = fs.readFileSync(path.join(skillPromptsDir, 'memory_analyzer.md'), 'utf-8');
+            const memoryBuilder = fs.readFileSync(path.join(skillPromptsDir, 'memory_builder.md'), 'utf-8');
+            const personaAnalyzer = fs.readFileSync(path.join(skillPromptsDir, 'persona_analyzer.md'), 'utf-8');
+            const personaBuilder = fs.readFileSync(path.join(skillPromptsDir, 'persona_builder.md'), 'utf-8');
+            const deepseekConfig = {
+                baseURL: (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com') + '/v1/chat/completions',
+                headers: { 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },
                 model: process.env.DEEPSEEK_MODEL || 'deepseek-chat',
-                messages: [{
-                        role: 'user',
-                        content: `分析以下微信聊天记录。对话参与者: ${senderList}。${identityHint}
-
-请以JSON格式返回分析结果（只返回JSON，不要其他文字）：
-{
-  "aiName": "对方的昵称（${metaAiName || '从对话中推断'}）",
-  "userName": "用户本人的名字（${metaUserName || '从对话中推断'}）",
-  "relationship": "两人之间的关系（如情侣/朋友/同事/家人等）",
-  "personality": "对方的性格特征描述（100字内）",
-  "speakingStyle": "对方的说话风格（50字内，如温柔细腻/大大咧咧等）",
-  "catchphrases": "对方的口头禅或常用语（逗号分隔）",
-  "emotionalPattern": "情绪模式（如乐观积极/容易焦虑/温柔体贴等）",
-  "notes": "其他值得注意的特征或建议"
-}
-
-聊天记录：
-${conversation.substring(0, 8000)}`
-                    }],
-                temperature: 0.7, max_tokens: 800,
-            }, { headers: { 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 60000 });
-            analysis = resp.data?.choices?.[0]?.message?.content || '';
+            };
+            // 并行调用：Part A 记忆分析 + Part B 性格分析
+            const [memoryResult, personaResult] = await Promise.all([
+                axios.post(deepseekConfig.baseURL, {
+                    model: deepseekConfig.model,
+                    messages: [{
+                            role: 'system',
+                            content: `${memoryAnalyzer}\n\n${memoryBuilder}\n\n你是关系记忆分析器。根据上述模板，从聊天记录中提取一段完整的 Relationship Memory。直接输出 Markdown，包含：关系概览、时间线、共同记忆、日常模式、争吵档案、甜蜜档案、分手档案。用中文。`
+                        }, {
+                            role: 'user',
+                            content: `对话参与者: ${senderList}。${identityHint}\n\n聊天记录：\n${conversation.substring(0, 12000)}`
+                        }],
+                    temperature: 0.7, max_tokens: 2000,
+                }, { headers: deepseekConfig.headers, timeout: 120000 }),
+                axios.post(deepseekConfig.baseURL, {
+                    model: deepseekConfig.model,
+                    messages: [{
+                            role: 'system',
+                            content: `${personaAnalyzer}\n\n${personaBuilder}\n\n你是性格行为分析器。根据上述5层模板，从聊天记录中提取一段完整的 Persona。直接输出 Markdown，严格包含5层结构：Layer 0 硬规则、Layer 1 身份、Layer 2 说话风格、Layer 3 情感模式、Layer 4 关系行为。用中文，每层都要有具体行为描述不是抽象标签。`
+                        }, {
+                            role: 'user',
+                            content: `对话参与者: ${senderList}。${identityHint}\n\n聊天记录：\n${conversation.substring(0, 12000)}`
+                        }],
+                    temperature: 0.7, max_tokens: 2000,
+                }, { headers: deepseekConfig.headers, timeout: 120000 }),
+            ]);
+            const partA = memoryResult.data?.choices?.[0]?.message?.content || '';
+            const partB = personaResult.data?.choices?.[0]?.message?.content || '';
+            // 提取基本字段（从 Part B 中解析）
+            let partBName = metaAiName || '';
+            const nameMatch = partB.match(/名字[：:]\s*(.+)/) || partB.match(/\*\*名字\*\*[：:]\s*(.+)/);
+            if (nameMatch)
+                partBName = nameMatch[1].trim();
+            analysis = `## PART A：关系记忆\n\n${partA}\n\n---\n\n## PART B：人物性格\n\n${partB}`;
+            profile = {
+                aiName: partBName || metaAiName || senders[0],
+                userName: metaUserName || '',
+                partA,
+                partB,
+            };
         }
         catch (e) {
             analysis = '分析失败: ' + e.message;
         }
-        // 解析 JSON (容错：去除 markdown 代码块包裹)
-        try {
-            let jsonStr = analysis.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-            // 提取第一个 { 到最后一个 } 之间的内容
-            const start = jsonStr.indexOf('{');
-            const end = jsonStr.lastIndexOf('}');
-            if (start >= 0 && end > start) {
-                jsonStr = jsonStr.substring(start, end + 1);
-                profile = JSON.parse(jsonStr);
-            }
-        }
-        catch {
-            // JSON 解析失败，保留原始 analysis 文本
-            console.warn('[Import] AI 结构化解析失败，使用原始文本');
-        }
-        // 保存分析结果 (含结构化 profile)
-        const resultSummary = JSON.stringify({ raw: analysis, profile });
+        // 保存分析结果 (Part A + Part B)
+        const resultSummary = JSON.stringify({ partA: profile.partA, partB: profile.partB });
         await pgPool.query(`UPDATE import_tasks SET result_summary=$1 WHERE id=$2`, [resultSummary, taskId]);
-        // AI 角色名: AI分析 > worker meta > senderStats 推断
+        // AI 角色名: Part B 解析 > worker meta > senderStats 推断
         let aiName = profile.aiName || task.rows[0]?.meta?.aiName || '';
         if (!aiName) {
             // 回退: 从 senderStats 分析
@@ -582,31 +595,27 @@ router.post('/apply', async (req, res) => {
             res.status(404).json({ error: '任务不存在或未完成' });
             return;
         }
-        // 合并结构化 profile 到 personality 文本
+        // 使用 ex-skill Part A + Part B 格式
         const p = profile || {};
-        const personality = [
-            p.personality ? `性格：${p.personality}` : '',
-            p.speakingStyle ? `说话风格：${p.speakingStyle}` : '',
-            p.catchphrases ? `口头禅：${p.catchphrases}` : '',
-            p.emotionalPattern ? `情绪模式：${p.emotionalPattern}` : '',
-            p.relationship ? `关系：${p.relationship}` : '',
-            p.notes ? `备注：${p.notes}` : '',
-        ].filter(Boolean).join('\n');
+        const partA = p.partA || '';
+        const partB = p.partB || '';
+        const aiName = p.aiName || '对方';
+        const userName = p.userName || '用户';
+        const personality = `## PART A：关系记忆\n\n${partA}\n\n---\n\n## PART B：人物性格\n\n${partB}`;
         const customPrompt = [
-            `【身份设定】`,
-            `你是"${p.aiName || '对方'}"，正在和"${p.userName || '用户'}"聊天。`,
-            `你不是"${p.userName || '用户'}"！你扮演的是${p.aiName || '对方'}的角色。`,
-            p.relationship ? `你们的关系是：${p.relationship}。` : '',
+            `你是"${aiName}"，正在和"${userName}"聊天。`,
+            `你不是"${userName}"！你扮演的是${aiName}的角色。`,
             '',
-            `【性格与风格】`,
-            p.personality ? `性格：${p.personality}` : '',
-            p.speakingStyle ? `说话风格：${p.speakingStyle}` : '',
-            p.catchphrases ? `常用语：${p.catchphrases}` : '',
-            p.emotionalPattern ? `情绪模式：${p.emotionalPattern}` : '',
-            p.notes ? `备注：${p.notes}` : '',
+            personality,
             '',
-            '请完全以这个身份说话，不要跳出来承认自己是AI。',
-        ].filter(Boolean).join('\n');
+            '## 运行规则',
+            '1. 你是' + aiName + '，不是AI助手。用ta的方式说话，用ta的逻辑思考',
+            '2. PART B 判断态度：ta会怎么回应？什么语气？',
+            '3. PART A 补充记忆：有什么共同经历可以自然融入？',
+            '4. 不要写括号动作描写，不要使用emoji',
+            '5. 不要跳出角色，不要解释自己是AI',
+            '6. Layer 0 硬规则：不说ta在现实中绝不可能说的话',
+        ].join('\n');
         const resultSummary = task.rows[0].result_summary;
         const meta = { profile: p, appliedAt: new Date().toISOString() };
         await pgPool.query(`INSERT INTO user_profiles (user_id, personality, custom_prompt, import_task_id, model_prefs)
@@ -618,6 +627,39 @@ router.post('/apply', async (req, res) => {
          import_task_id = EXCLUDED.import_task_id,
          model_prefs = EXCLUDED.model_prefs,
          updated_at = NOW()`, [req.user.userId, personality, customPrompt, taskId, JSON.stringify(meta)]);
+        // 同步到 Hermes：创建 ex-skill persona 并切换
+        try {
+            const { execSync } = require('child_process');
+            const fs = require('fs');
+            const path = require('path');
+            const slug = 'ex_' + (aiName || 'custom').replace(/[^a-zA-Z0-9一-鿿]/g, '_').toLowerCase().replace(/_+/g, '_').substring(0, 30);
+            const skillDir = path.join('/home/dandelion/.hermes/skills/ex-skill', slug);
+            fs.mkdirSync(skillDir, { recursive: true });
+            const skillMd = [
+                '---',
+                `name: ${slug}`,
+                `description: ${aiName}，${(p.partB || '').substring(0, 60).replace(/\n/g, ' ')}`,
+                'user-invocable: true',
+                '---',
+                '',
+                `# ${aiName}`,
+                '',
+                personality,
+                '',
+                '## 运行规则',
+                `1. 你是${aiName}，不是AI助手。用你的方式说话`,
+                '2. PART B 判断态度，PART A 补充记忆',
+                '3. 不要跳出角色，不要解释自己是AI',
+            ].join('\n');
+            fs.writeFileSync(path.join(skillDir, 'SKILL.md'), skillMd);
+            execSync(`python3 /home/dandelion/.hermes/scripts/persona_manager.py switch ${slug} --keep-memory`, {
+                timeout: 15000,
+            });
+            console.log(`[Import] Hermes已同步创建+切换: ${slug}`);
+        }
+        catch (e) {
+            console.warn(`[Import] Hermes同步跳过: ${e.message}`);
+        }
         res.json({ message: 'AI 陪伴配置已更新', personality, customPrompt });
     }
     catch (error) {

@@ -368,6 +368,51 @@ app.post('/webhook', async (req, res) => {
     }
 });
 /**
+ * POST /api/hermes/webhook
+ * 接收 Hermes Agent 转发的消息，写入 conversation_logs
+ *
+ * 请求体:
+ * {
+ *   "direction": "inbound" | "outbound",
+ *   "from_user": "wxid_xxx",
+ *   "content": "...",
+ *   "msg_type": "text",
+ *   "message_id": "...",
+ *   "timestamp": 1719000000
+ * }
+ */
+app.post('/api/hermes/webhook', async (req, res) => {
+    try {
+        const { direction, from_user, content, msg_type, message_id, timestamp } = req.body;
+        if (!from_user || !content) {
+            res.status(400).json({ error: '缺少必要字段: from_user, content' });
+            return;
+        }
+        // 查找或创建用户
+        const userResult = await pgPool.query(`INSERT INTO users (wechat_id, last_active_at)
+       VALUES ($1, NOW())
+       ON CONFLICT (wechat_id) DO UPDATE SET last_active_at = NOW()
+       RETURNING id`, [from_user]);
+        const userId = userResult.rows[0].id;
+        // 写入对话日志
+        const role = direction === 'outbound' ? 'assistant' : 'user';
+        await pgPool.query(`INSERT INTO conversation_logs (user_id, wechat_id, role, content, created_at)
+       VALUES ($1, $2, $3, $4, $5)`, [
+            userId,
+            from_user,
+            role,
+            content,
+            timestamp ? new Date(timestamp * 1000) : new Date(),
+        ]);
+        console.log(`[HermesWebhook] 📝 ${role}: "${content.substring(0, 40)}" (user=${from_user})`);
+        res.status(200).json({ ok: true });
+    }
+    catch (error) {
+        console.error('[HermesWebhook] ❌ 写入失败:', error.message);
+        res.status(500).json({ error: '写入失败' });
+    }
+});
+/**
  * GET /health
  * 健康检查接口，返回各服务状态
  */

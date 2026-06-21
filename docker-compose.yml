@@ -12,6 +12,7 @@ services:
   # 使用 expect(unbuffer) 提供伪终端以捕获 incoming 消息
   # ===========================================================================
   weclaw-bridge:
+    profiles: ["disabled"]  # Hermes 接管
     build:
       context: .
       dockerfile: weclaw-bridge.Dockerfile
@@ -51,11 +52,12 @@ services:
       - .env
     environment:
       - NODE_ENV=production
+      - ILINK_POLLING_ENABLED=false
     volumes:
       - api_data:/app/data
       - uploads_data:/app/uploads
       - ./stickers:/app/stickers
-      - fastagent_data:/app/fastagent-data:ro
+      # fastagent_data removed (Hermes replaces FastAgent)
     restart: unless-stopped
     depends_on:
       redis:
@@ -87,6 +89,7 @@ services:
       - .env
     environment:
       - NODE_ENV=production
+      - ILINK_POLLING_ENABLED=false
     volumes:
       - uploads_data:/app/uploads
       - ./stickers:/app/stickers
@@ -241,6 +244,7 @@ services:
   # 将 weclaw-bridge 输出的终端 QR 文本转为 SVG/HTML
   # ===========================================================================
   weixin-bridge:
+    profiles: ["disabled"]  # Hermes 接管
     image: node:20-alpine
     container_name: weixin-bridge
     working_dir: /app
@@ -265,6 +269,7 @@ services:
   # FastAgent - WeChat 消息收发 (支持webhook转发)
   # ===========================================================================
   fastagent:
+    profiles: ["disabled"]  # Hermes 接管
     build:
       context: .
       dockerfile: fastagent.Dockerfile
@@ -279,6 +284,32 @@ services:
       - IM_GATEWAY_WORKSPACE_DIR=/app/data
       - IM_GATEWAY_DATA_DIR=/app/data
       - IM_GATEWAY_AGENT_ID=companion
+    restart: unless-stopped
+    networks:
+      - companion-net
+
+  # ===========================================================================
+  # Hermes Agent - 微信消息处理 + AI角色扮演
+  # 替换 FastAgent + api-server 消息链路
+  # ===========================================================================
+  hermes-companion:
+    build:
+      context: .
+      dockerfile: hermes.Dockerfile
+    container_name: hermes-companion
+    ports:
+      - "18789:18789"
+    volumes:
+      - hermes_data:/app/data
+      - ./hermes-config.yaml:/app/config/config.yaml:ro
+      - ./scripts/hermes-webhook-bridge.js:/app/scripts/webhook-bridge.js:ro
+    environment:
+      - HERMES_HOME=/app/data
+      - WEBHOOK_URL=http://api-server:3000/api/hermes/webhook
+      - WEIXIN_DM_POLICY=open
+      - WEIXIN_GROUP_POLICY=disabled
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
     restart: unless-stopped
     networks:
       - companion-net
@@ -320,6 +351,8 @@ volumes:
     driver: local
 
   fastagent_data:
+    driver: local
+  hermes_data:
     driver: local
   redis_data:
     driver: local

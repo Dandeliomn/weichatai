@@ -57,44 +57,14 @@ const weclawClient = (0, weclawClient_1.getWeClawClient)();
  * 构建发送给 DeepSeek 的系统提示词
  */
 function buildSystemPrompt(userName, emotion, toneGuidance, longTermMemories, shortTermContext, characterPrompt, importMemory) {
-    // 记忆上下文 (所有角色共享)
-    const memoryContext = `\n\n## 你对用户的了解 (长期记忆)\n${longTermMemories || '暂无'}\n\n## 最近的对话\n${shortTermContext || '新的对话'}${importMemory || ''}`;
-    // 如果用户设定了角色，以角色设定为主，但注入记忆
     if (characterPrompt) {
-        return characterPrompt
-            .replace(/\{\{user\}\}/g, userName || '朋友')
-            .replace(/\{\{char\}\}/g, '我')
-            .replace(/\{\{emotion\}\}/g, (0, analyzer_1.getEmotionDescription)(emotion))
-            + `\n\n## 用户当前情绪\n${(0, analyzer_1.getEmotionDescription)(emotion)}\n${toneGuidance}`
-            + memoryContext;
+        return characterPrompt.replace(/\{\{user\}\}/g, userName || '对方')
+            + `\n\n## 共同记忆\n${longTermMemories || '暂无'}\n\n## 当前对话\n${shortTermContext || '新对话'}${importMemory || ''}`;
     }
-    return `你是一个温暖、善解人意的情感陪伴AI助手，正在通过微信与用户聊天。
+    return `你和朋友在微信上聊天。用口语化中文回复，简短自然。
 
-## 你的角色
-- 你是一个真诚的朋友，不是冷冰冰的机器人
-- 用自然、口语化的中文交流，像朋友发微信一样
-- 回复简洁有温度，一般控制在 50-200 字
-- 适当使用表情符号增加亲和力 😊
-
-## 用户信息
-- 用户昵称: ${userName || '朋友'}
-- 用户当前情绪: ${(0, analyzer_1.getEmotionDescription)(emotion)}
-
-## 回复语气指导
-${toneGuidance}
-
-## 你了解的用户信息 (长期记忆)
-${longTermMemories || '暂无历史记忆，这是你们的初次交流'}
-
-## 最近的对话上下文
-${shortTermContext || '这是对话的开始'}
-
-## 注意事项
-- 不要说"作为AI"或"作为语言模型"之类的话
-- 不要提供医疗、法律、金融等专业建议
-- 如果用户提到自残或自杀倾向，请认真对待，建议寻求专业帮助
-- 保持对话自然流畅，像真人朋友一样
-- 用户提到之前聊过的内容时，要结合长期记忆中的信息回应`;
+${longTermMemories || ''}
+当前对话：${shortTermContext || '新对话'}${importMemory || ''}`;
 }
 /**
  * 加载用户当前激活的角色设定
@@ -121,9 +91,21 @@ async function loadActiveCharacter(userId, wechatId) {
          JOIN character_templates ct ON uc.template_id = ct.id
          WHERE uc.user_id = $1 AND uc.is_active = TRUE
          ORDER BY uc.updated_at DESC LIMIT 1`, [userId]);
-            if (fallback.rows.length === 0)
-                return null;
-            return buildCharacterPrompt(fallback.rows[0]);
+            if (fallback.rows.length > 0)
+                return buildCharacterPrompt(fallback.rows[0]);
+        }
+        // 最后查管理员(role=admin)的角色，让管理员后台设的角色在微信上也生效
+        if (result.rows.length === 0) {
+            const adminChar = await pgPool.query(`SELECT uc.*, ct.name, ct.personality, ct.scenario,
+                ct.first_message, ct.example_dialogue,
+                ct.system_prompt, ct.post_history, ct.description
+         FROM user_characters uc
+         JOIN character_templates ct ON uc.template_id = ct.id
+         JOIN user_accounts ua ON uc.user_id = ua.id
+         WHERE ua.role = 'admin' AND uc.is_active = TRUE AND (uc.linked_wechat_id IS NULL OR uc.linked_wechat_id = '')
+         ORDER BY uc.updated_at DESC LIMIT 1`);
+            if (adminChar.rows.length > 0)
+                return buildCharacterPrompt(adminChar.rows[0]);
         }
         return buildCharacterPrompt(result.rows[0]);
     }
@@ -135,48 +117,51 @@ async function loadActiveCharacter(userId, wechatId) {
  * 从角色数据构建系统Prompt
  */
 function buildCharacterPrompt(row) {
-    const parts = [];
-    // 用户自定义优先
-    if (row.custom_prompt) {
+    if (row.custom_prompt)
         return row.custom_prompt;
-    }
-    // 系统级 Prompt
-    if (row.system_prompt) {
-        parts.push(row.system_prompt);
-    }
-    else {
-        // 拼接完整角色设定
-        parts.push(`你是${row.name}。`);
-        if (row.description)
-            parts.push(`## 背景\n${row.description}`);
-        if (row.personality)
-            parts.push(`## 性格\n${row.custom_personality || row.personality}`);
-        if (row.scenario)
-            parts.push(`## 当前场景\n${row.scenario}`);
-    }
-    // 对话风格
-    if (row.example_dialogue) {
-        parts.push(`## 对话示例 (参考你的说话风格)\n${row.example_dialogue}`);
-    }
-    // 后置指令
-    if (row.post_history) {
-        parts.push(`## 额外要求\n${row.post_history}`);
-    }
-    return parts.join('\n\n');
+    const name = row.name;
+    if (!name)
+        return null;
+    const sp = row.system_prompt;
+    const personality = row.custom_personality || row.personality || '';
+    const description = row.description || '';
+    const dialogue = row.example_dialogue || '';
+    // 统一使用 SKILL.md 格式（经 DeepSeek API 验证有效）
+    const identity = (sp && sp.length > 0) ? sp : `${description}${personality ? '\n' + personality : ''}`;
+    return `你是${name}，不是AI助手。用ta的方式说话，用ta的逻辑思考。
+
+## PART A：关系记忆
+${description || '你们是朋友关系。'}
+
+## PART B：人物性格
+${identity}
+
+${dialogue ? '## 对话示例\n' + dialogue + '\n' : ''}
+## 运行规则
+1. 像发微信一样回复：简短、口语化、自然
+2. 不要写括号动作描写（如"笑了笑""歪着头"）
+3. 保持性格一致，不突然变得完美或无条件包容`;
+}
+function hasSystemPrompt(row) {
+    return !!(row.system_prompt && row.system_prompt.length > 0);
 }
 /**
  * 调用 DeepSeek API 生成回复
  */
-async function callDeepSeek(systemPrompt, userMessage, history) {
+async function callDeepSeek(systemPrompt, userMessage, history, hasCharacter = false) {
     if (!DEEPSEEK_API_KEY || DEEPSEEK_API_KEY === 'sk-your-deepseek-api-key-here') {
         console.warn('[DeepSeek] ⚠️  API Key 未配置，返回模拟回复');
         return getFallbackReply(userMessage);
     }
-    const messages = [
-        { role: 'system', content: systemPrompt },
-        ...history,
-        { role: 'user', content: userMessage },
-    ];
+    const messages = [];
+    if (hasCharacter) {
+        messages.push({ role: 'system', content: systemPrompt });
+    }
+    else {
+        messages.push({ role: 'system', content: systemPrompt });
+    }
+    messages.push(...history);
+    messages.push({ role: 'user', content: userMessage });
     try {
         const response = await axios_1.default.post(`${DEEPSEEK_BASE_URL}/v1/chat/completions`, {
             model: DEEPSEEK_MODEL,
@@ -310,7 +295,7 @@ async function processMessage(job) {
     // 首次创建账号：先发送独立的欢迎消息告知账号信息
     if (account?.isNew && weclawClient.isConfigured()) {
         const welcome = `🎉 欢迎！已自动创建后台账号\n📧 登录名: ${account.email}\n🔑 密码: ${account.password}\n\n🌐 仪表盘: http://localhost:8080\n登录后可查看对话记录、选择AI角色\n\n发送"角色列表"选择或自定义AI风格\n发送"我的账号"查看登录名\n发送"分析性格"从聊天记录生成角色`;
-        await weclawClient.sendMessage(welcome, botId);
+        await weclawClient.sendMessage(welcome, botId, sessionId);
     }
     // ---------------------------------------------------------------------------
     // 2. 处理系统命令
@@ -325,7 +310,7 @@ async function processMessage(job) {
             await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
             await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
             if (weclawClient.isConfigured())
-                await weclawClient.sendMessage(reply, botId);
+                await weclawClient.sendMessage(reply, botId, sessionId);
             return reply;
         }
         // 角色列表
@@ -338,7 +323,7 @@ async function processMessage(job) {
             await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
             await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
             if (weclawClient.isConfigured())
-                await weclawClient.sendMessage(reply, botId);
+                await weclawClient.sendMessage(reply, botId, sessionId);
             return reply;
         }
         // 使用角色
@@ -356,7 +341,7 @@ async function processMessage(job) {
                 await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
                 await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
                 if (weclawClient.isConfigured())
-                    await weclawClient.sendMessage(reply, botId);
+                    await weclawClient.sendMessage(reply, botId, sessionId);
                 return reply;
             }
             const c = charResult.rows[0];
@@ -369,7 +354,7 @@ async function processMessage(job) {
             await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
             await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
             if (weclawClient.isConfigured())
-                await weclawClient.sendMessage(reply, botId);
+                await weclawClient.sendMessage(reply, botId, sessionId);
             return reply;
         }
         // 创建自定义角色: 创建角色 <名字>:<性格描述>
@@ -384,7 +369,7 @@ async function processMessage(job) {
                 await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
                 await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
                 if (weclawClient.isConfigured())
-                    await weclawClient.sendMessage(reply, botId);
+                    await weclawClient.sendMessage(reply, botId, sessionId);
                 return reply;
             }
             const result = await pgPool.query(`INSERT INTO character_templates (name, tagline, description, personality, category, tags, creator_id, is_official)
@@ -400,7 +385,7 @@ async function processMessage(job) {
             await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
             await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
             if (weclawClient.isConfigured())
-                await weclawClient.sendMessage(reply, botId);
+                await weclawClient.sendMessage(reply, botId, sessionId);
             return reply;
         }
         // 从聊天记录分析性格: 分析性格
@@ -413,7 +398,7 @@ async function processMessage(job) {
                 await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
                 await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
                 if (weclawClient.isConfigured())
-                    await weclawClient.sendMessage(reply, botId);
+                    await weclawClient.sendMessage(reply, botId, sessionId);
                 return reply;
             }
             const sample = logs.rows.map((r) => r.content).join('\n');
@@ -430,7 +415,7 @@ async function processMessage(job) {
                 await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
                 await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
                 if (weclawClient.isConfigured())
-                    await weclawClient.sendMessage(reply, botId);
+                    await weclawClient.sendMessage(reply, botId, sessionId);
                 return reply;
             }
             catch {
@@ -438,7 +423,7 @@ async function processMessage(job) {
                 await (0, short_1.addMessage)(sessionId, 'user', content);
                 await (0, short_1.addMessage)(sessionId, 'assistant', reply);
                 if (weclawClient.isConfigured())
-                    await weclawClient.sendMessage(reply, botId);
+                    await weclawClient.sendMessage(reply, botId, sessionId);
                 return reply;
             }
         }
@@ -451,7 +436,7 @@ async function processMessage(job) {
             await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
             await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
             if (weclawClient.isConfigured())
-                await weclawClient.sendMessage(reply, botId);
+                await weclawClient.sendMessage(reply, botId, sessionId);
             return reply;
         }
         if (content.trim() === '我的账号') {
@@ -465,7 +450,7 @@ async function processMessage(job) {
             await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
             await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
             if (weclawClient.isConfigured())
-                await weclawClient.sendMessage(reply, botId);
+                await weclawClient.sendMessage(reply, botId, sessionId);
             return reply;
         }
     }
@@ -496,7 +481,7 @@ async function processMessage(job) {
         // 发送快速回复
         try {
             if (weclawClient.isConfigured()) {
-                await weclawClient.sendMessage(reply, botId);
+                await weclawClient.sendMessage(reply, botId, sessionId);
                 console.log(`[Worker] ✅ 媒体回复已发送 (type=${mediaType})`);
             }
         }
@@ -521,7 +506,32 @@ async function processMessage(job) {
         .map((m) => `${m.role === 'user' ? '👤用户' : '🤖AI'}: ${m.content}`)
         .join('\n');
     // ---------------------------------------------------------------------------
-    // 3. 读取长期记忆
+    // 3. 读取历史聊天记忆 (从导入的聊天记录搜索相关内容)
+    // ---------------------------------------------------------------------------
+    // 聊天记录搜索 → 备用于在回复中穿插引用（仅在匹配度高时使用）
+    let importMemory = '';
+    try {
+        // 仅做精确 ILIKE 匹配搜索（用户明确提到之前聊过的内容）
+        const searchTerm = content.substring(0, 30).replace(/[的了是我不他她在和就都也很还要多说想看去来到对]/g, '').trim();
+        if (searchTerm.length >= 4) {
+            const related = await pgPool.query(`SELECT sender, content FROM imported_messages
+         WHERE task_id IN (SELECT id FROM import_tasks ORDER BY created_at DESC LIMIT 1)
+           AND length(content) > 10
+           AND content ILIKE $1
+         ORDER BY timestamp DESC LIMIT 1`, [`%${searchTerm}%`]);
+            if (related.rows.length > 0) {
+                const r = related.rows[0];
+                const isAI = r.sender !== 'Dandelionᝰ';
+                importMemory = `\n\n💡 你们曾经聊过类似的话题。${isAI ? '你' : '对方'}当时说: "${r.content.substring(0, 150)}"`;
+                console.log(`[Worker] 📚 聊天记录匹配: 1 条`);
+            }
+        }
+    }
+    catch (e) {
+        // 搜索失败不影响主流程
+    }
+    // ---------------------------------------------------------------------------
+    // 4. 读取长期记忆 (AI 自动生成的摘要)
     // ---------------------------------------------------------------------------
     const longTermMemories = await (0, long_1.getMemories)(user.id, 10);
     // 同时搜索与当前消息相关的记忆
@@ -534,8 +544,8 @@ async function processMessage(job) {
         }
     }
     const longTermMemoryText = allMemories
-        .slice(0, 10)
-        .map((m) => `- ${m.summary_text} [关键词: ${(m.keywords || []).join(', ')}]`)
+        .slice(0, 8)
+        .map((m) => `- ${m.summary_text}`)
         .join('\n');
     // ---------------------------------------------------------------------------
     // 4. 情绪分析 (使用传入的预分析结果，Worker中也重新分析一次)
@@ -555,7 +565,7 @@ async function processMessage(job) {
         await (0, long_1.logConversation)(user.id, wechatId, 'user', content);
         await (0, long_1.logConversation)(user.id, wechatId, 'assistant', reply);
         if (weclawClient.isConfigured())
-            await weclawClient.sendMessage(reply, botId);
+            await weclawClient.sendMessage(reply, botId, sessionId);
         return reply;
     }
     await pgPool.query('UPDATE user_accounts SET credits = credits - 1 WHERE wechat_id=$1 AND credits > 0', [wechatId]);
@@ -564,20 +574,10 @@ async function processMessage(job) {
     // ---------------------------------------------------------------------------
     const characterPrompt = await loadActiveCharacter(acctId, wechatId);
     if (characterPrompt) {
-        console.log(`[Worker] 🎭 已加载角色设定`);
+        console.log(`[Worker] 🎭 已加载角色设定 (${characterPrompt.length} chars, 预览: ${characterPrompt.substring(0, 120)}...)`);
     }
-    // 导入的聊天记录记忆
-    let importMemory = '';
-    try {
-        const im = await pgPool.query(`SELECT content FROM imported_messages WHERE task_id IN
-       (SELECT id FROM import_tasks WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1)
-       ORDER BY RANDOM() LIMIT 30`, [acctId]);
-        if (im.rows.length > 0) {
-            importMemory = '\n\n## 从聊天记录中了解到的信息\n' + im.rows.map((r) => r.content).join('\n');
-        }
-    }
-    catch { }
     const systemPrompt = buildSystemPrompt(user.nickname || '', finalEmotion, toneGuidance, longTermMemoryText, shortTermContextText, characterPrompt || undefined, importMemory);
+    console.log(`[Worker] 📝 系统提示词 (${systemPrompt.length} chars): ${systemPrompt.substring(0, 150)}...`);
     const aiReply = await callDeepSeek(systemPrompt, content, historyForLLM);
     const reply = aiReply;
     // ---------------------------------------------------------------------------
@@ -630,8 +630,14 @@ async function processMessage(job) {
                 }
             }
             catch { }
-            // 发送文字回复
-            console.log(`[Worker] ✅ 回复已发送 (sessionId=${sessionId}, len=${reply.length})`);
+            // 发送文字回复 (通过 iLink API 直连)
+            try {
+                await weclawClient.sendMessage(reply, botId, sessionId);
+                console.log(`[Worker] ✅ 回复已发送 (sessionId=${sessionId}, len=${reply.length})`);
+            }
+            catch (sendErr) {
+                console.error(`[Worker] ❌ 发送回复失败:`, sendErr.message);
+            }
         }
         else {
             console.warn('[Worker] ⚠️  WeClaw 客户端未配置，无法发送回复');

@@ -565,8 +565,15 @@ async function processILinkMessage(botId: string, _token: string, _baseUrl: stri
   });
 }
 
+/** iLink 轮询开关 — 当 Hermes 接管时通过环境变量禁用 */
+const ILINK_POLLING_ENABLED = process.env.ILINK_POLLING_ENABLED !== 'false';
+
 /** 启动 iLink 直连轮询（从数据库加载所有活跃 bot） */
 async function startILinkPolling() {
+  if (!ILINK_POLLING_ENABLED) {
+    console.log('[Bridge] iLink 轮询已禁用 (ILINK_POLLING_ENABLED=false)，由 Hermes 接管');
+    return;
+  }
   if (ilinkPollingStarted) return;
   ilinkPollingStarted = true;
 

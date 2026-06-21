@@ -82,30 +82,36 @@ async function ensureBridgeSession() {
 /**
  * POST /api/bridge/register-bot
  * WeClaw 桥接脚本扫码成功后调用，注册新登录的微信账号
- * 请求体: { botId, apiToken, wechatId?, nickname?, botIndex }
+ * 请求体: { botId, apiToken, botToken?, getUpdatesBuf?, ilinkUserId?, ilinkBaseUrl?, wechatId?, nickname?, botIndex? }
  */
 router.post('/bridge/register-bot', async (req, res) => {
     try {
-        const { botId, apiToken, wechatId, nickname, botIndex } = req.body;
+        const { botId, apiToken, botToken, getUpdatesBuf, ilinkUserId, ilinkBaseUrl, wechatId, nickname, botIndex } = req.body;
         if (!botId || !apiToken) {
             res.status(400).json({ error: '缺少 botId 或 apiToken' });
             return;
         }
-        // 检查是否已被用户删除 (deleted_at IS NOT NULL)
-        const existing = await pgPool.query('SELECT deleted_at FROM bot_accounts WHERE bot_id = $1', [botId]);
-        if (existing.rows.length > 0 && existing.rows[0].deleted_at != null) {
-            console.log(`[Bot] ⏭️ 跳过已删除的 Bot: ${botId}`);
-            res.json({ ok: false, message: 'Bot 已被用户删除', botId });
+        // 检查是否已被用户删除或停用
+        const existing = await pgPool.query('SELECT deleted_at, is_active FROM bot_accounts WHERE bot_id = $1', [botId]);
+        if (existing.rows.length > 0 && (existing.rows[0].deleted_at != null || !existing.rows[0].is_active)) {
+            console.log(`[Bot] ⏭️ 跳过已删除/停用的 Bot: ${botId}`);
+            res.json({ ok: false, message: 'Bot 已被用户删除或停用', botId });
             return;
         }
-        await pgPool.query(`INSERT INTO bot_accounts (bot_id, api_token, wechat_id, nickname, bot_index, is_active)
-       VALUES ($1, $2, $3, $4, $5, TRUE)
+        await pgPool.query(`INSERT INTO bot_accounts (bot_id, api_token, bot_token, get_updates_buf, ilink_user_id, ilink_base_url, wechat_id, nickname, bot_index, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
        ON CONFLICT (bot_id)
-       DO UPDATE SET api_token = $2, wechat_id = COALESCE($3, bot_accounts.wechat_id),
-                     nickname = COALESCE($4, bot_accounts.nickname),
-                     last_active_at = NOW()`, [botId, apiToken, wechatId || null, nickname || null, botIndex ?? 0]);
+       DO UPDATE SET api_token = $2, bot_token = COALESCE($3, bot_accounts.bot_token),
+                     get_updates_buf = COALESCE($4, bot_accounts.get_updates_buf),
+                     ilink_user_id = COALESCE($5, bot_accounts.ilink_user_id),
+                     ilink_base_url = COALESCE($6, bot_accounts.ilink_base_url),
+                     wechat_id = COALESCE($7, bot_accounts.wechat_id),
+                     nickname = COALESCE($8, bot_accounts.nickname),
+                     last_active_at = NOW()`, [botId, apiToken, botToken || null, getUpdatesBuf || '', ilinkUserId || null, ilinkBaseUrl || 'https://ilinkai.weixin.qq.com', wechatId || null, nickname || null, botIndex ?? 0]);
         console.log(`[Bot] ✅ 注册/更新 Bot: ${botId} (idx=${botIndex})`);
         res.json({ ok: true, botId });
+        // 注册成功后尝试启动 iLink 直连轮询
+        startILinkPolling().catch((e) => console.warn('[iLink] 启动轮询失败:', e.message));
     }
     catch (error) {
         console.error('[Bot] 注册失败:', error.message);
@@ -242,21 +248,8 @@ router.delete('/bridge/bots/:id', auth_1.authenticate, async (req, res) => {
             await pgPool.query('UPDATE bot_accounts SET is_active = FALSE WHERE id = $1', [botId]);
             console.log(`[Bot] ⏸️ 已停用: ${botIdStr}`);
         }
-        // 尝试通知 weclaw-bridge 删除 (curl /del)
-        try {
-            const http = require('http');
-            await new Promise((resolve) => {
-                const req = http.request({
-                    hostname: 'weclaw-bridge', port: 26322,
-                    path: '/api/connections',
-                    method: 'GET',
-                    timeout: 3000,
-                }, () => resolve());
-                req.on('error', () => resolve());
-                req.end();
-            });
-        }
-        catch { }
+        // weclaw-bridge 的 bot_registrar 会自动检测到删除并断开 session
+        // 不需要从 api-server 直接操作 weclaw-bridge
         res.json({ ok: true, message: permanent ? 'Bot 已删除' : 'Bot 已停用', botId: botIdStr });
     }
     catch (error) {
@@ -414,6 +407,165 @@ router.get('/bridge-login', auth_1.authenticate, auth_1.requireAdmin, async (_re
     }
     else {
         res.status(502).json({ error: '桥接服务不可用' });
+    }
+});
+// =========================================================================
+// iLink API 直连 — 长轮询接收微信消息 (类似 Hermes 实现)
+// 绕过 weclaw-bridge bot CLI, 直接用 bot_token 调用 iLink HTTP API
+// =========================================================================
+const ILINK_BASE = 'https://ilinkai.weixin.qq.com';
+const EP_GET_UPDATES = 'ilink/bot/getupdates';
+let ilinkPollingStarted = false;
+async function ilinkPollLoop(botId, token, baseUrl, initialBuf) {
+    let syncBuf = initialBuf;
+    let consecutiveFailures = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+        try {
+            const body = JSON.stringify({
+                get_updates_buf: syncBuf,
+                base_info: { channel_version: '2.2.0' },
+            });
+            const url = `${baseUrl || ILINK_BASE}/${EP_GET_UPDATES}`;
+            const resp = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                    AuthorizationType: 'ilink_bot_token',
+                    'iLink-App-Id': 'bot',
+                    'iLink-App-ClientVersion': '131584',
+                },
+                body,
+                signal: AbortSignal.timeout(40_000),
+            });
+            if (!resp.ok) {
+                consecutiveFailures++;
+                if (consecutiveFailures > 5) {
+                    console.warn(`[iLink] ${botId} 连续失败${consecutiveFailures}次, 暂停30s`);
+                    await new Promise(r => setTimeout(r, 30_000));
+                    consecutiveFailures = 0;
+                }
+                else {
+                    await new Promise(r => setTimeout(r, 2_000));
+                }
+                continue;
+            }
+            consecutiveFailures = 0;
+            const data = await resp.json();
+            const ret = data.ret ?? 0;
+            const errcode = data.errcode ?? 0;
+            if (ret === -14 || errcode === -14) {
+                console.warn(`[iLink] ${botId} session 过期, 暂停10分钟`);
+                await new Promise(r => setTimeout(r, 600_000));
+                continue;
+            }
+            const newBuf = data.get_updates_buf || '';
+            if (newBuf && newBuf !== syncBuf) {
+                syncBuf = newBuf;
+                await pgPool.query('UPDATE bot_accounts SET get_updates_buf = $1 WHERE bot_id = $2', [syncBuf, botId]);
+            }
+            const msgs = data.msgs || [];
+            for (const msg of msgs) {
+                try {
+                    await processILinkMessage(botId, token, baseUrl, msg);
+                }
+                catch (e) {
+                    console.error(`[iLink] ${botId} 消息处理失败:`, e.message);
+                }
+            }
+        }
+        catch (e) {
+            if (e.name === 'TimeoutError' || e.name === 'AbortError') {
+                continue; // 长轮询超时正常
+            }
+            consecutiveFailures++;
+            console.warn(`[iLink] ${botId} 轮询错误:`, e.message);
+            await new Promise(r => setTimeout(r, 2_000));
+        }
+    }
+}
+/** 将 iLink 消息转为 webhook 格式并提交处理 */
+async function processILinkMessage(botId, _token, _baseUrl, msg) {
+    const fromUserId = (msg.from_user_id || '').toString().trim();
+    if (!fromUserId || fromUserId === botId)
+        return;
+    const itemList = msg.item_list || [];
+    let content = '';
+    for (const item of itemList) {
+        if (item.type === 1) {
+            content = item.text_item?.text || '';
+        }
+    }
+    if (!content)
+        return;
+    const webhookPayload = {
+        FromUserName: fromUserId,
+        ToUserName: botId,
+        MsgType: 'text',
+        Content: content,
+        CreateTime: Math.floor(Date.now() / 1000),
+        MsgId: msg.message_id || `${Date.now()}`,
+    };
+    await fetch(`http://localhost:${process.env.PORT || 3000}/webhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(webhookPayload),
+    }).catch((e) => {
+        console.warn(`[iLink] webhook 转发失败:`, e.message);
+    });
+}
+/** iLink 轮询开关 — 当 Hermes 接管时通过环境变量禁用 */
+const ILINK_POLLING_ENABLED = process.env.ILINK_POLLING_ENABLED !== 'false';
+/** 启动 iLink 直连轮询（从数据库加载所有活跃 bot） */
+async function startILinkPolling() {
+    if (!ILINK_POLLING_ENABLED) {
+        console.log('[Bridge] iLink 轮询已禁用 (ILINK_POLLING_ENABLED=false)，由 Hermes 接管');
+        return;
+    }
+    if (ilinkPollingStarted)
+        return;
+    ilinkPollingStarted = true;
+    try {
+        const result = await pgPool.query(`SELECT bot_id, api_token, bot_token, get_updates_buf, ilink_user_id, ilink_base_url
+       FROM bot_accounts WHERE is_active = TRUE AND deleted_at IS NULL AND bot_token IS NOT NULL`);
+        for (const row of result.rows) {
+            const token = row.bot_token || row.api_token;
+            if (!token)
+                continue;
+            console.log(`[iLink] 🚀 启动直连轮询: ${row.bot_id}`);
+            ilinkPollLoop(row.bot_id, token, row.ilink_base_url || ILINK_BASE, row.get_updates_buf || '')
+                .catch((e) => console.error(`[iLink] ${row.bot_id} 轮询异常退出:`, e.message));
+        }
+        if (result.rows.length === 0) {
+            console.log('[iLink] 没有活跃 bot, 等待注册后启动');
+            ilinkPollingStarted = false;
+        }
+    }
+    catch (e) {
+        console.error('[iLink] 启动失败:', e.message);
+        ilinkPollingStarted = false;
+    }
+}
+// 模块加载时自动尝试启动
+setTimeout(() => {
+    startILinkPolling().catch(() => { });
+}, 5_000);
+/**
+ * POST /api/bridge/extract-memories — 从聊天记录提取结构化记忆
+ */
+router.post('/bridge/extract-memories', auth_1.authenticate, auth_1.requireAdmin, async (_req, res) => {
+    try {
+        const { extractStructuredMemories } = require('../memory/extract');
+        res.json({ status: 'started', message: '记忆提取已启动（异步执行）' });
+        extractStructuredMemories(pgPool).then((count) => {
+            console.log(`[API] ✅ 记忆提取完成: ${count} 条`);
+        }).catch((e) => {
+            console.error(`[API] ❌ 记忆提取失败:`, e.message);
+        });
+    }
+    catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 exports.default = router;

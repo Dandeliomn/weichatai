@@ -1,0 +1,25 @@
+# hermes-config.yaml
+# Hermes Agent 配置文件
+
+model:
+  provider: deepseek
+  model: deepseek-chat
+  max_tokens: 1024
+  temperature: 0.8
+
+gateway:
+  channel: weixin
+  dm_policy: open
+  group_policy: disabled
+  output: jsonl  # JSONL 格式输出，方便 webhook bridge 解析
+
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 2200
+  user_char_limit: 1375
+  write_approval: false
+
+agent:
+  # 禁用内置 personality overlay，只用 SOUL.md
+  personalities: {}

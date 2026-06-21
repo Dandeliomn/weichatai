@@ -1,9 +1,9 @@
 "use strict";
 /**
- * WeClaw HTTP 客户端
- * 封装对 WeClawBot-API 的 HTTP 调用，用于主动发送微信消息
+ * WeClaw 客户端 — 通过 iLink API 直连发送微信消息
  *
- * WeClawBot-API 文档: https://github.com/Cp0204/WeClawBot-API
+ * 绕过 weclawbot-api 的 HTTP 接口（始终 401），
+ * 直接用 bot_token 调用 iLink sendmessage API（类似 Hermes 实现）
  */
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
@@ -12,147 +12,140 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.WeClawClient = void 0;
 exports.getWeClawClient = getWeClawClient;
 const axios_1 = __importDefault(require("axios"));
+const ILINK_BASE = 'https://ilinkai.weixin.qq.com';
+const EP_SEND_MESSAGE = 'ilink/bot/sendmessage';
 /**
  * WeClaw 客户端类
- * 管理 API Token 认证和 HTTP 请求
+ * 管理 Bot Token 认证，通过 iLink API 直连发送消息
  */
 class WeClawClient {
-    apiUrl;
     botId;
     apiToken;
-    http;
     openilinkUrl;
     openilinkToken;
     constructor() {
-        this.apiUrl = process.env.WECLAW_API_URL || 'http://weclaw-bridge:26322';
         this.botId = process.env.WECLAW_BOT_ID || '';
         this.apiToken = process.env.WECLAW_API_TOKEN || '';
         this.openilinkUrl = process.env.OPENILINK_HUB_URL || 'http://openilink-hub:9800';
         this.openilinkToken = process.env.OPENILINK_TOKEN || '';
-        // 创建带认证头的 axios 实例
-        this.http = axios_1.default.create({
-            baseURL: this.apiUrl,
-            timeout: 15000,
-            headers: {
-                'Authorization': `Bearer ${this.apiToken}`,
-                'Content-Type': 'application/json',
-            },
-        });
-        // 请求拦截器: 记录日志
-        this.http.interceptors.request.use((config) => {
-            console.log(`[WeClawClient] ➡️  ${config.method?.toUpperCase()} ${config.url}`);
-            return config;
-        }, (error) => Promise.reject(error));
-        // 响应拦截器: 记录日志
-        this.http.interceptors.response.use((response) => {
-            console.log(`[WeClawClient] ✅ ${response.status} ${response.config.url}`);
-            return response;
-        }, (error) => {
-            console.error(`[WeClawClient] ❌ 请求失败:`, error.message);
-            return Promise.reject(error);
-        });
     }
     /**
-     * 验证客户端是否已配置
+     * 验证客户端是否可发送（总是 true, sendMessage 内部从 DB 查 bot_token）
      */
     isConfigured() {
-        return !!(this.botId && this.apiToken) || !!(this.openilinkToken || process.env.OPENILINK_TOKEN);
+        return true;
     }
     /**
-     * 发送文本消息到微信
+     * 发送文本消息到微信（iLink API 直连）
      *
      * @param text - 消息文本内容
-     * @param botId - 可选，指定 Bot ID（默认使用环境变量中的配置）
+     * @param botId - Bot ID (如 ed446b646fbe@im.bot)
+     * @param toUserId - 接收消息的微信用户 ID
      * @returns API 响应
      */
-    async sendMessage(text, botId) {
+    async sendMessage(text, botId, toUserId) {
+        console.log(`[WeClawClient] sendMessage 被调用 text="${text.substring(0, 20)}..." botId=${botId} toUserId=${toUserId}`);
         if (!text || text.trim().length === 0) {
             throw new Error('消息内容不能为空');
         }
-        // 从数据库查询 bot 的 API token（多账号支持）
-        let targetBot = botId || this.botId;
-        let apiToken = '';
-        let queryBot = targetBot;
+        // 从数据库查询 bot 凭证
+        const targetBot = botId || this.botId;
+        let botToken = '';
+        let ilinkBaseUrl = ILINK_BASE;
+        let targetUser = toUserId || '';
         try {
             const { Pool } = require('pg');
-            const p = new Pool({ connectionString: process.env.DATABASE_URL || 'postgresql://weclaw:weclaw_secret@postgres:5432/weclaw_companion' });
-            // 先按 botId 查，再按 wechatId 查，最后取第一个活跃的
-            let r = queryBot
-                ? await p.query('SELECT bot_id, api_token FROM bot_accounts WHERE (bot_id=$1 OR wechat_id=$1) AND is_active=TRUE ORDER BY bot_index LIMIT 1', [queryBot])
-                : await p.query('SELECT bot_id, api_token FROM bot_accounts WHERE is_active=TRUE ORDER BY bot_index LIMIT 1');
+            const p = new Pool({
+                connectionString: process.env.DATABASE_URL || 'postgresql://weclaw:weclaw_secret@postgres:5432/weclaw_companion',
+            });
+            const r = await p.query(`SELECT bot_token, api_token, ilink_user_id, ilink_base_url
+         FROM bot_accounts
+         WHERE (bot_id = $1 OR wechat_id = $1) AND is_active = TRUE AND deleted_at IS NULL
+         ORDER BY bot_index LIMIT 1`, [targetBot]);
             if (r.rows.length > 0) {
-                targetBot = r.rows[0].bot_id;
-                apiToken = r.rows[0].api_token;
+                botToken = r.rows[0].bot_token || r.rows[0].api_token || '';
+                if (r.rows[0].ilink_base_url)
+                    ilinkBaseUrl = r.rows[0].ilink_base_url;
+                if (!targetUser)
+                    targetUser = r.rows[0].ilink_user_id || '';
             }
             await p.end();
         }
         catch (e) {
             console.warn('[WeClawClient] DB 查询失败:', e.message);
         }
-        // 如果数据库查到了 token，用 HTTP API 发
-        if (targetBot && apiToken) {
-            try {
-                const resp = await axios_1.default.get(`${this.apiUrl}/bots/${encodeURIComponent(targetBot)}/messages`, {
-                    params: { text },
-                    headers: { 'Authorization': `Bearer ${apiToken}` },
-                    timeout: 15000,
-                });
-                if (resp.data?.code === 200 || resp.data?.code === undefined) {
-                    console.log(`[WeClawClient] ✅ 通过 WeClawBot-API 发送成功 (bot=${targetBot})`);
-                    return { code: 200, message: 'OK' };
-                }
+        if (!botToken) {
+            // 回退: 用环境变量（旧版）
+            const oldToken = this.apiToken;
+            if (!oldToken || !this.botId) {
+                throw new Error('WeClawClient 未配置: 无可用 Bot 账号');
             }
-            catch (e) {
-                console.warn('[WeClawClient] WeClawBot-API 发送失败:', e.message);
-            }
+            // 用旧路径（weclawbot-api HTTP）试一次
+            return this._sendViaLegacy(text, targetBot || this.botId, oldToken);
         }
-        // 回退: 用环境变量 (兼容旧版单账号)
-        if (this.apiToken && this.botId) {
-            try {
-                const response = await this.http.get(`/bots/${encodeURIComponent(targetBot || this.botId)}/messages`, { params: { text } });
-                return response.data;
-            }
-            catch (error) {
-                if (error.response?.status >= 400) {
-                    const response = await this.http.post(`/bots/${encodeURIComponent(targetBot || this.botId)}/messages`, { text });
-                    return response.data;
-                }
-                throw error;
-            }
-        }
-        throw new Error('WeClawClient 未配置: 无可用 Bot 账号');
-    }
-    /**
-     * 发送"正在输入"状态
-     *
-     * @param status - 1=正在输入, 2=停止输入
-     * @param botId - 可选，指定 Bot ID
-     */
-    async sendTypingStatus(status, botId) {
-        const targetBot = botId || this.botId;
-        if (!targetBot || !this.apiToken) {
-            throw new Error('WeClawClient 未配置');
-        }
+        // iLink API 直连
         try {
-            const response = await this.http.get(`/bots/${encodeURIComponent(targetBot)}/typing`, { params: { status } });
-            return response.data;
+            const body = JSON.stringify({
+                base_info: { channel_version: '2.2.0' },
+                msg: {
+                    from_user_id: '',
+                    to_user_id: targetUser || targetBot,
+                    client_id: `weclaw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                    message_type: 2,
+                    message_state: 2,
+                    item_list: [{ type: 1, text_item: { text } }],
+                },
+            });
+            const url = `${ilinkBaseUrl}/${EP_SEND_MESSAGE}`;
+            const resp = await axios_1.default.post(url, body, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    AuthorizationType: 'ilink_bot_token',
+                    Authorization: `Bearer ${botToken}`,
+                    'iLink-App-Id': 'bot',
+                    'iLink-App-ClientVersion': '131584',
+                },
+                timeout: 15000,
+            });
+            const result = resp.data || {};
+            const ret = result.ret ?? 0;
+            const errcode = result.errcode ?? 0;
+            if (ret === -14 || errcode === -14) {
+                console.warn(`[WeClawClient] ⚠️  session 过期 (bot=${targetBot})`);
+                return { code: -14, message: 'Session expired', error: result.errmsg || 'session expired' };
+            }
+            if (ret !== 0 || errcode !== 0) {
+                console.warn(`[WeClawClient] ⚠️  iLink 发送返回错误 ret=${ret} errcode=${errcode}: ${result.errmsg}`);
+                return { code: errcode || ret, message: result.errmsg || 'iLink error', error: result.errmsg };
+            }
+            console.log(`[WeClawClient] ✅ iLink 发送成功 (to=${targetUser || targetBot})`);
+            return { code: 200, message: 'OK' };
         }
-        catch (error) {
-            console.error(`[WeClawClient] 发送输入状态失败:`, error.message);
-            throw error;
+        catch (e) {
+            console.error(`[WeClawClient] ❌ iLink 发送失败:`, e.message);
+            // iLink 失败时回退到旧路径
+            return this._sendViaLegacy(text, targetBot, botToken);
         }
     }
     /**
-     * 发送消息（带"正在输入"状态模拟）
-     * 先显示"正在输入..."，延迟后再发送实际消息
-     *
-     * @param text - 消息文本
-     * @param botId - 可选 Bot ID
+     * 旧路径: weclawbot-api HTTP (可能 401, 作为最后的尝试)
      */
+    async _sendViaLegacy(text, botId, token) {
+        try {
+            const legacyUrl = process.env.WECLAW_API_URL || 'http://weclaw-bridge:26322';
+            const resp = await axios_1.default.get(`${legacyUrl}/bots/${encodeURIComponent(botId)}/messages`, { params: { text }, headers: { Authorization: `Bearer ${token}` }, timeout: 10000 });
+            console.log(`[WeClawClient] ✅ 旧路径发送成功 (bot=${botId})`);
+            return { code: 200, message: 'OK' };
+        }
+        catch {
+            console.warn(`[WeClawClient] ⚠️  旧路径发送失败 (401 expected), 消息未发送: bot=${botId}`);
+            return { code: 401, message: 'Unauthorized', error: 'weclawbot-api 不支持的接口' };
+        }
+    }
     /**
      * 发送图片/表情包
      */
-    async sendImage(imageUrl, botId) {
+    async sendImage(imageUrl, _botId) {
         const token = this.openilinkToken || process.env.OPENILINK_TOKEN || '';
         if (!token) {
             console.warn('[WeClawClient] 未配置 OpeniLink Token，无法发送图片');
@@ -171,22 +164,7 @@ class WeClawClient {
     }
     async sendWithTyping(text, botId) {
         try {
-            // 1. 显示"正在输入" (OpeniLink 可能不支持，忽略错误)
-            try {
-                await this.sendTypingStatus(1, botId);
-            }
-            catch { }
-            // 2. 模拟人类打字延迟
-            const typingDelay = Math.min(Math.max(text.length * 50, 1000), 4000);
-            await new Promise((resolve) => setTimeout(resolve, typingDelay));
-            // 3. 停止"正在输入"
-            try {
-                await this.sendTypingStatus(2, botId);
-            }
-            catch { }
-            // 4. 短暂延迟后发送消息
-            await new Promise((resolve) => setTimeout(resolve, 300));
-            // 5. 发送实际消息
+            await new Promise((resolve) => setTimeout(resolve, Math.min(Math.max(text.length * 50, 1000), 4000)));
             await this.sendMessage(text, botId);
         }
         catch (error) {
