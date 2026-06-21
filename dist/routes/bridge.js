@@ -86,7 +86,7 @@ async function ensureBridgeSession() {
  */
 router.post('/bridge/register-bot', async (req, res) => {
     try {
-        const { botId, apiToken, botToken, getUpdatesBuf, ilinkUserId, ilinkBaseUrl, wechatId, nickname, botIndex } = req.body;
+        const { botId, apiToken, botToken, getUpdatesBuf, ilinkUserId, ilinkBaseUrl, wechatId, nickname, botIndex, character_id, linked_user_id } = req.body;
         if (!botId || !apiToken) {
             res.status(400).json({ error: '缺少 botId 或 apiToken' });
             return;
@@ -98,8 +98,8 @@ router.post('/bridge/register-bot', async (req, res) => {
             res.json({ ok: false, message: 'Bot 已被用户删除或停用', botId });
             return;
         }
-        await pgPool.query(`INSERT INTO bot_accounts (bot_id, api_token, bot_token, get_updates_buf, ilink_user_id, ilink_base_url, wechat_id, nickname, bot_index, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
+        await pgPool.query(`INSERT INTO bot_accounts (bot_id, api_token, bot_token, get_updates_buf, ilink_user_id, ilink_base_url, wechat_id, nickname, bot_index, character_id, linked_user_id, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE)
        ON CONFLICT (bot_id)
        DO UPDATE SET api_token = $2, bot_token = COALESCE($3, bot_accounts.bot_token),
                      get_updates_buf = COALESCE($4, bot_accounts.get_updates_buf),
@@ -107,7 +107,16 @@ router.post('/bridge/register-bot', async (req, res) => {
                      ilink_base_url = COALESCE($6, bot_accounts.ilink_base_url),
                      wechat_id = COALESCE($7, bot_accounts.wechat_id),
                      nickname = COALESCE($8, bot_accounts.nickname),
-                     last_active_at = NOW()`, [botId, apiToken, botToken || null, getUpdatesBuf || '', ilinkUserId || null, ilinkBaseUrl || 'https://ilinkai.weixin.qq.com', wechatId || null, nickname || null, botIndex ?? 0]);
+                     linked_user_id = COALESCE($11, bot_accounts.linked_user_id),
+                     character_id = COALESCE($10, bot_accounts.character_id),
+                     last_active_at = NOW()`, [botId, apiToken, botToken || null, getUpdatesBuf || '', ilinkUserId || null, ilinkBaseUrl || 'https://ilinkai.weixin.qq.com', wechatId || null, nickname || null, botIndex ?? 0, character_id || null, linked_user_id || null]);
+        // 如果有 character_id，同步激活 user_characters
+        if (character_id && linked_user_id) {
+            await pgPool.query(`INSERT INTO user_characters (user_id, template_id, linked_wechat_id, is_active)
+         VALUES ($1, $2, $3, TRUE)
+         ON CONFLICT (user_id, template_id, linked_wechat_id)
+         DO UPDATE SET is_active = TRUE, updated_at = NOW()`, [linked_user_id, character_id, wechatId || botId]);
+        }
         console.log(`[Bot] ✅ 注册/更新 Bot: ${botId} (idx=${botIndex})`);
         res.json({ ok: true, botId });
         // 注册成功后尝试启动 iLink 直连轮询
@@ -150,13 +159,58 @@ router.get('/bridge/bot-token', async (req, res) => {
     }
 });
 /** 获取 WeClaw 桥接的多个 Bot 列表 (公开接口，用于前端检测连接状态) */
-router.get('/bridge/bots', async (_req, res) => {
+/**
+ * GET /api/bridge/bots
+ * 返回 Bot 列表。普通用户只看自己的；管理员看全部。
+ * 新增返回 character 信息。
+ */
+router.get('/bridge/bots', auth_1.authenticate, async (req, res) => {
     try {
-        // 自动从 OpeniLink 同步 Bot 列表
         await syncOpeniLinkBots().catch(() => { });
-        const result = await pgPool.query('SELECT id, bot_id, wechat_id, nickname, bot_index, is_active, last_active_at FROM bot_accounts WHERE deleted_at IS NULL ORDER BY bot_index');
-        const connected = result.rows.some((r) => r.is_active);
-        res.json({ bots: result.rows, total: result.rows.length, connected });
+        const currentUserId = req.user?.id;
+        const isAdmin = req.user?.role === 'admin';
+        let query;
+        let params;
+        if (isAdmin) {
+            query = `SELECT b.id, b.bot_id, b.wechat_id, b.nickname, b.bot_index,
+                      b.is_active, b.last_active_at, b.created_at,
+                      b.character_id, b.linked_user_id,
+                      ct.name AS character_name, ct.tagline AS character_tagline
+               FROM bot_accounts b
+               LEFT JOIN character_templates ct ON b.character_id = ct.id
+               WHERE b.deleted_at IS NULL
+               ORDER BY b.bot_index`;
+            params = [];
+        }
+        else {
+            query = `SELECT b.id, b.bot_id, b.wechat_id, b.nickname, b.bot_index,
+                      b.is_active, b.last_active_at, b.created_at,
+                      b.character_id, b.linked_user_id,
+                      ct.name AS character_name, ct.tagline AS character_tagline
+               FROM bot_accounts b
+               LEFT JOIN character_templates ct ON b.character_id = ct.id
+               WHERE b.deleted_at IS NULL AND b.linked_user_id = $1
+               ORDER BY b.bot_index`;
+            params = [currentUserId];
+        }
+        const result = await pgPool.query(query, params);
+        const bots = result.rows.map((r) => ({
+            id: r.id,
+            bot_id: r.bot_id,
+            wechat_id: r.wechat_id,
+            nickname: r.nickname,
+            bot_index: r.bot_index,
+            is_active: r.is_active,
+            last_active_at: r.last_active_at,
+            created_at: r.created_at,
+            character: r.character_id ? {
+                id: r.character_id,
+                name: r.character_name,
+                tagline: r.character_tagline,
+            } : null,
+        }));
+        const connected = bots.some((b) => b.is_active);
+        res.json({ bots, total: bots.length, connected });
     }
     catch (error) {
         res.status(500).json({ error: error.message });
@@ -233,6 +287,14 @@ router.delete('/bridge/bots/:id', auth_1.authenticate, async (req, res) => {
     try {
         const botId = parseInt(req.params.id);
         const permanent = String(req.query.permanent) === 'true';
+        const currentUserId = req.user?.id;
+        const isAdmin = req.user?.role === 'admin';
+        // 非管理员只能操作自己的 bot
+        const botCheck = await pgPool.query('SELECT linked_user_id FROM bot_accounts WHERE id = $1', [botId]);
+        if (!isAdmin && botCheck.rows[0]?.linked_user_id !== currentUserId) {
+            res.status(403).json({ error: '无权限操作此 Bot' });
+            return;
+        }
         // 先查 bot_id 用于通知 weclaw-bridge
         const bot = await pgPool.query('SELECT bot_id FROM bot_accounts WHERE id = $1', [botId]);
         if (bot.rows.length === 0) {
@@ -250,11 +312,69 @@ router.delete('/bridge/bots/:id', auth_1.authenticate, async (req, res) => {
         }
         // weclaw-bridge 的 bot_registrar 会自动检测到删除并断开 session
         // 不需要从 api-server 直接操作 weclaw-bridge
+        // 同时从 OpeniLink Hub 删除 Bot（防止 sync 加回来）
+        if (permanent) {
+            try {
+                const oiSession = await ensureBridgeSession();
+                if (oiSession) {
+                    await axios_1.default.delete(`http://openilink-hub:9800/api/bots/${encodeURIComponent(botIdStr)}`, {
+                        headers: { Cookie: oiSession },
+                        timeout: 5000,
+                    });
+                    console.log(`[Bot] 🔌 已从 OpeniLink 删除: ${botIdStr}`);
+                }
+            }
+            catch (e) {
+                console.warn(`[Bot] OpeniLink 删除失败 (可能已不存在): ${e.message}`);
+            }
+        }
         res.json({ ok: true, message: permanent ? 'Bot 已删除' : 'Bot 已停用', botId: botIdStr });
     }
     catch (error) {
         console.error('[Bot] 删除失败:', error.message);
         res.status(500).json({ error: '删除失败' });
+    }
+});
+/**
+ * PUT /api/bridge/bots/:id/character
+ * 更换 Bot 的角色
+ * Body: { character_id: number }
+ */
+router.put('/bridge/bots/:id/character', auth_1.authenticate, async (req, res) => {
+    try {
+        const botId = parseInt(req.params.id);
+        const { character_id } = req.body;
+        const currentUserId = req.user?.id;
+        const isAdmin = req.user?.role === 'admin';
+        if (!character_id) {
+            res.status(400).json({ error: '缺少 character_id' });
+            return;
+        }
+        // 权限检查：admin 或 bot owner
+        const bot = await pgPool.query('SELECT linked_user_id, wechat_id FROM bot_accounts WHERE id = $1 AND deleted_at IS NULL', [botId]);
+        if (bot.rows.length === 0) {
+            res.status(404).json({ error: 'Bot 不存在' });
+            return;
+        }
+        if (!isAdmin && bot.rows[0].linked_user_id !== currentUserId) {
+            res.status(403).json({ error: '无权限' });
+            return;
+        }
+        await pgPool.query('UPDATE bot_accounts SET character_id = $1, linked_user_id = COALESCE(linked_user_id, $2) WHERE id = $3', [character_id, currentUserId, botId]);
+        // 同步 user_characters
+        const wechatId = bot.rows[0].wechat_id;
+        if (currentUserId && wechatId) {
+            await pgPool.query(`INSERT INTO user_characters (user_id, template_id, linked_wechat_id, is_active)
+         VALUES ($1, $2, $3, TRUE)
+         ON CONFLICT (user_id, template_id, linked_wechat_id)
+         DO UPDATE SET template_id = $2, is_active = TRUE, updated_at = NOW()`, [currentUserId, character_id, wechatId]);
+        }
+        console.log(`[Bot] 🔄 ${botId} 角色 → ${character_id}`);
+        res.json({ ok: true });
+    }
+    catch (error) {
+        console.error('[Bot] 换角色失败:', error.message);
+        res.status(500).json({ error: error.message });
     }
 });
 // ---- OpeniLink 集成: 扫码登录代理 (后端持有 session, 前端无感) ----
@@ -383,6 +503,15 @@ async function syncOpeniLinkBots() {
             const botId = bot.id || bot.bot_id || bot.wechat_id;
             if (!botId)
                 continue;
+            // 检查是否已被删除: 同时按 bot_id 和 wechat_id 查
+            const deleted = await pgPool.query(`SELECT id FROM bot_accounts
+         WHERE deleted_at IS NOT NULL
+           AND (bot_id = $1 OR wechat_id = $2)
+         LIMIT 1`, [botId, botId]);
+            if (deleted.rows.length > 0) {
+                // 已被用户删除，跳过
+                continue;
+            }
             // 写入 bot_accounts (如果不存在)
             await pgPool.query(`INSERT INTO bot_accounts (bot_id, api_token, wechat_id, nickname, is_active)
          VALUES ($1, $2, $3, $4, TRUE)
@@ -422,6 +551,12 @@ async function ilinkPollLoop(botId, token, baseUrl, initialBuf) {
     // eslint-disable-next-line no-constant-condition
     while (true) {
         try {
+            // 检查 bot 是否已被停用/删除，如果是则退出循环
+            const activeCheck = await pgPool.query('SELECT is_active, deleted_at FROM bot_accounts WHERE bot_id = $1', [botId]);
+            if (activeCheck.rows.length === 0 || !activeCheck.rows[0].is_active || activeCheck.rows[0].deleted_at) {
+                console.log(`[iLink] ${botId} 已停用/删除，停止轮询`);
+                return;
+            }
             const body = JSON.stringify({
                 get_updates_buf: syncBuf,
                 base_info: { channel_version: '2.2.0' },
