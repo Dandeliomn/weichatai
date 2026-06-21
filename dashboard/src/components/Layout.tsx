@@ -28,6 +28,7 @@ export default function Layout() {
     { key: '/', icon: <DashboardOutlined />, label: '首页概览' },
     { key: '/profile', icon: <UserOutlined />, label: '我的' },
     { key: '/characters', icon: <SmileOutlined />, label: '角色管理' },
+    { key: '/bridge', icon: <LinkOutlined />, label: '微信桥接' },
     { key: '/import', icon: <ImportOutlined />, label: '聊天导入' },
     { key: '/stickers', icon: <PictureOutlined />, label: '表情包' },
   ];
@@ -36,7 +37,6 @@ export default function Layout() {
     { key: '/conversations', icon: <MessageOutlined />, label: '对话浏览' },
     { key: '/queue', icon: <MonitorOutlined />, label: '队列监控' },
     { key: '/admin-logs', icon: <SettingOutlined />, label: '操作日志' },
-    { key: '/bridge', icon: <LinkOutlined />, label: '微信桥接' },
     { key: '/settings', icon: <SettingOutlined />, label: '系统设置' },
   ] : [];
   const menuItems = [...commonItems, ...adminItems];
