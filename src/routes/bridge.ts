@@ -620,6 +620,16 @@ async function ilinkPollLoop(botId: string, token: string, baseUrl: string, init
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
+      // 检查 bot 是否已被停用/删除，如果是则退出循环
+      const activeCheck = await pgPool.query(
+        'SELECT is_active, deleted_at FROM bot_accounts WHERE bot_id = $1',
+        [botId]
+      );
+      if (activeCheck.rows.length === 0 || !activeCheck.rows[0].is_active || activeCheck.rows[0].deleted_at) {
+        console.log(`[iLink] ${botId} 已停用/删除，停止轮询`);
+        return;
+      }
+
       const body = JSON.stringify({
         get_updates_buf: syncBuf,
         base_info: { channel_version: '2.2.0' },

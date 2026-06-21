@@ -289,6 +289,19 @@ app.post('/webhook', async (req: Request, res: Response) => {
       (mediaType ? ` media=${mediaType}` : ` content="${content.substring(0, 30)}"`)
     );
 
+    // 检查对应 Bot 是否已停用/删除，如果是则忽略消息
+    if (toUserName) {
+      const botCheck = await pgPool.query(
+        'SELECT is_active, deleted_at FROM bot_accounts WHERE is_active = TRUE AND deleted_at IS NULL AND (bot_id = $1 OR wechat_id = $1) LIMIT 1',
+        [toUserName]
+      );
+      if (botCheck.rows.length === 0) {
+        console.log(`[Webhook] ⏭️ Bot ${toUserName} 已停用/删除，忽略消息`);
+        res.status(200).json({ reply: '' });
+        return;
+      }
+    }
+
     // 如果有base64媒体数据，存入media-store
     let storedMedia: {
       fileUrl: string;
