@@ -1,1 +1,11 @@
 node_modules/
+dist/
+*.log
+.env
+.DS_Store
+# Python
+__pycache__/
+*.pyc
+# IDE
+.vscode/
+.idea/
