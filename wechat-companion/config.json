@@ -1,7 +1,0 @@
-{
-  "channel": "weixin",
-  "weixin": {
-    "apiUrl": "http://weclaw-bridge:26322",
-    "webhook": "http://api-server:3000/webhook"
-  }
-}
