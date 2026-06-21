@@ -91,7 +91,7 @@ async function ensureBridgeSession(): Promise<string | null> {
  */
 router.post('/bridge/register-bot', async (req: Request, res: Response) => {
   try {
-    const { botId, apiToken, botToken, getUpdatesBuf, ilinkUserId, ilinkBaseUrl, wechatId, nickname, botIndex } = req.body;
+    const { botId, apiToken, botToken, getUpdatesBuf, ilinkUserId, ilinkBaseUrl, wechatId, nickname, botIndex, character_id, linked_user_id } = req.body;
     if (!botId || !apiToken) {
       res.status(400).json({ error: '缺少 botId 或 apiToken' });
       return;
@@ -108,8 +108,8 @@ router.post('/bridge/register-bot', async (req: Request, res: Response) => {
     }
 
     await pgPool.query(
-      `INSERT INTO bot_accounts (bot_id, api_token, bot_token, get_updates_buf, ilink_user_id, ilink_base_url, wechat_id, nickname, bot_index, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
+      `INSERT INTO bot_accounts (bot_id, api_token, bot_token, get_updates_buf, ilink_user_id, ilink_base_url, wechat_id, nickname, bot_index, character_id, linked_user_id, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE)
        ON CONFLICT (bot_id)
        DO UPDATE SET api_token = $2, bot_token = COALESCE($3, bot_accounts.bot_token),
                      get_updates_buf = COALESCE($4, bot_accounts.get_updates_buf),
@@ -117,9 +117,22 @@ router.post('/bridge/register-bot', async (req: Request, res: Response) => {
                      ilink_base_url = COALESCE($6, bot_accounts.ilink_base_url),
                      wechat_id = COALESCE($7, bot_accounts.wechat_id),
                      nickname = COALESCE($8, bot_accounts.nickname),
+                     linked_user_id = COALESCE($11, bot_accounts.linked_user_id),
+                     character_id = COALESCE($10, bot_accounts.character_id),
                      last_active_at = NOW()`,
-      [botId, apiToken, botToken || null, getUpdatesBuf || '', ilinkUserId || null, ilinkBaseUrl || 'https://ilinkai.weixin.qq.com', wechatId || null, nickname || null, botIndex ?? 0]
+      [botId, apiToken, botToken || null, getUpdatesBuf || '', ilinkUserId || null, ilinkBaseUrl || 'https://ilinkai.weixin.qq.com', wechatId || null, nickname || null, botIndex ?? 0, character_id || null, linked_user_id || null]
     );
+
+    // 如果有 character_id，同步激活 user_characters
+    if (character_id && linked_user_id) {
+      await pgPool.query(
+        `INSERT INTO user_characters (user_id, template_id, linked_wechat_id, is_active)
+         VALUES ($1, $2, $3, TRUE)
+         ON CONFLICT (user_id, template_id, linked_wechat_id)
+         DO UPDATE SET is_active = TRUE, updated_at = NOW()`,
+        [linked_user_id, character_id, wechatId || botId]
+      );
+    }
 
     console.log(`[Bot] ✅ 注册/更新 Bot: ${botId} (idx=${botIndex})`);
     res.json({ ok: true, botId });
@@ -300,6 +313,17 @@ router.delete('/bridge/bots/:id', authenticate, async (req: Request, res: Respon
   try {
     const botId = parseInt(req.params.id as string);
     const permanent = String(req.query.permanent) === 'true';
+    const currentUserId = (req as any).user?.id;
+    const isAdmin = (req as any).user?.role === 'admin';
+
+    // 非管理员只能操作自己的 bot
+    const botCheck = await pgPool.query(
+      'SELECT linked_user_id FROM bot_accounts WHERE id = $1', [botId]
+    );
+    if (!isAdmin && botCheck.rows[0]?.linked_user_id !== currentUserId) {
+      res.status(403).json({ error: '无权限操作此 Bot' });
+      return;
+    }
 
     // 先查 bot_id 用于通知 weclaw-bridge
     const bot = await pgPool.query('SELECT bot_id FROM bot_accounts WHERE id = $1', [botId]);
@@ -331,6 +355,62 @@ router.delete('/bridge/bots/:id', authenticate, async (req: Request, res: Respon
   } catch (error: any) {
     console.error('[Bot] 删除失败:', error.message);
     res.status(500).json({ error: '删除失败' });
+  }
+});
+
+/**
+ * PUT /api/bridge/bots/:id/character
+ * 更换 Bot 的角色
+ * Body: { character_id: number }
+ */
+router.put('/bridge/bots/:id/character', authenticate, async (req: Request, res: Response) => {
+  try {
+    const botId = parseInt(req.params.id as string);
+    const { character_id } = req.body;
+    const currentUserId = (req as any).user?.id;
+    const isAdmin = (req as any).user?.role === 'admin';
+
+    if (!character_id) {
+      res.status(400).json({ error: '缺少 character_id' });
+      return;
+    }
+
+    // 权限检查：admin 或 bot owner
+    const bot = await pgPool.query(
+      'SELECT linked_user_id, wechat_id FROM bot_accounts WHERE id = $1 AND deleted_at IS NULL',
+      [botId]
+    );
+    if (bot.rows.length === 0) {
+      res.status(404).json({ error: 'Bot 不存在' });
+      return;
+    }
+    if (!isAdmin && bot.rows[0].linked_user_id !== currentUserId) {
+      res.status(403).json({ error: '无权限' });
+      return;
+    }
+
+    await pgPool.query(
+      'UPDATE bot_accounts SET character_id = $1 WHERE id = $2',
+      [character_id, botId]
+    );
+
+    // 同步 user_characters
+    const wechatId = bot.rows[0].wechat_id;
+    if (currentUserId && wechatId) {
+      await pgPool.query(
+        `INSERT INTO user_characters (user_id, template_id, linked_wechat_id, is_active)
+         VALUES ($1, $2, $3, TRUE)
+         ON CONFLICT (user_id, template_id, linked_wechat_id)
+         DO UPDATE SET template_id = $2, is_active = TRUE, updated_at = NOW()`,
+        [currentUserId, character_id, wechatId]
+      );
+    }
+
+    console.log(`[Bot] 🔄 ${botId} 角色 → ${character_id}`);
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error('[Bot] 换角色失败:', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
