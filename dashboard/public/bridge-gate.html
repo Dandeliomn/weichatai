@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>微信桥接 - 情感陪伴AI</title>
+<style>
+  body { font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f0f2f5; }
+  .card { background: #fff; padding: 40px; border-radius: 12px; text-align: center; box-shadow: 0 2px 12px rgba(0,0,0,0.08); max-width: 400px; }
+  h2 { margin: 0 0 8px; }
+  p { color: #666; margin: 8px 0 24px; }
+  .btn { display: inline-block; padding: 10px 32px; background: #1890ff; color: #fff; border-radius: 6px; text-decoration: none; font-size: 15px; }
+  .spinner { border: 3px solid #f0f0f0; border-top: 3px solid #1890ff; border-radius: 50%; width: 32px; height: 32px; animation: spin 1s linear infinite; margin: 16px auto; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="card" id="checking">
+  <h2>🔗 微信桥接</h2>
+  <div class="spinner"></div>
+  <p>正在验证登录状态...</p>
+</div>
+<div class="card" id="no-auth" style="display:none">
+  <h2>⚠️ 未登录</h2>
+  <p>请先登录仪表盘后再访问微信桥接</p>
+  <a class="btn" href="/login">前往登录</a>
+</div>
+<script>
+(function() {
+  var token = localStorage.getItem('access_token');
+  if (!token) {
+    document.getElementById('checking').style.display = 'none';
+    document.getElementById('no-auth').style.display = 'block';
+  } else {
+    // Auto-login to OpeniLink
+    fetch('/api/bridge-login')
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.ok) window.location.href = 'http://localhost:9800/dashboard/overview';
+        else { document.getElementById('checking').style.display = 'none'; document.getElementById('no-auth').style.display = 'block'; }
+      })
+      .catch(function() {
+        document.getElementById('checking').style.display = 'none';
+        document.getElementById('no-auth').style.display = 'block';
+      });
+  }
+})();
+</script>
+</body>
+</html>
