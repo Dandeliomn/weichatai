@@ -6,8 +6,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl git ca-certificates nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 Hermes Agent
-RUN pip install hermes-agent aiohttp cryptography qrcode
+# 安装 Hermes Agent (使用清华镜像)
+RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    --trusted-host pypi.tuna.tsinghua.edu.cn \
+    --default-timeout=120 \
+    hermes-agent aiohttp cryptography qrcode
 
 # 工作目录
 RUN mkdir -p /app/data /app/config /app/scripts
