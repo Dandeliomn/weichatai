@@ -710,7 +710,33 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<string> {
   // ---------------------------------------------------------------------------
   // 6. 加载用户角色设定 + 构建系统提示
   // ---------------------------------------------------------------------------
-  const characterPrompt = await loadActiveCharacter(acctId, wechatId);
+  // 优先从 bot_accounts.character_id 加载角色
+  let characterPrompt: string | null = null;
+  if (job.data.botId) {
+    try {
+      const botChar = await pgPool.query(
+        `SELECT ct.system_prompt, ct.personality, ct.name, ct.description,
+                ct.example_dialogue, uc.custom_personality, uc.custom_prompt
+         FROM bot_accounts b
+         LEFT JOIN character_templates ct ON b.character_id = ct.id
+         LEFT JOIN user_characters uc ON uc.template_id = ct.id AND uc.linked_wechat_id = $2
+         WHERE b.bot_id = $1 AND b.character_id IS NOT NULL
+         LIMIT 1`,
+        [job.data.botId, job.data.wechatId]
+      );
+      if (botChar.rows.length > 0) {
+        characterPrompt = buildCharacterPrompt(botChar.rows[0]);
+      }
+    } catch {
+      // fall through to loadActiveCharacter
+    }
+  }
+
+  // Fallback: 已有的 loadActiveCharacter 逻辑
+  if (!characterPrompt) {
+    characterPrompt = await loadActiveCharacter(acctId, wechatId);
+  }
+
   if (characterPrompt) {
     console.log(`[Worker] 🎭 已加载角色设定 (${characterPrompt.length} chars, 预览: ${characterPrompt.substring(0, 120)}...)`);
   }
