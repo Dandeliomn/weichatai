@@ -141,10 +141,16 @@ forward_message() {
   TIMESTAMP=$(date +%s)
   MSG_ID="${FROM}_${TIMESTAMP}"
 
+  # 获取当前活跃的 Bot ID（缓存在文件里，由 bot_registrar 更新）
+  BOT_TO=""
+  if [ -f /tmp/active_bot_id ]; then
+    BOT_TO=$(cat /tmp/active_bot_id)
+  fi
+
   # 用 printf 写入临时文件，避免 shell 变量展开中的注入风险
   TMPFILE=$(mktemp /tmp/webhook-XXXXXX)
-  printf '{"FromUserName":"%s","MsgType":"text","Content":"%s","CreateTime":%s,"MsgId":"%s"}' \
-    "$FROM" "$CONTENT" "$TIMESTAMP" "$MSG_ID" > "$TMPFILE"
+  printf '{"FromUserName":"%s","ToUserName":"%s","MsgType":"text","Content":"%s","CreateTime":%s,"MsgId":"%s"}' \
+    "$FROM" "$BOT_TO" "$CONTENT" "$TIMESTAMP" "$MSG_ID" > "$TMPFILE"
 
   wget -q -O /dev/null --post-file="$TMPFILE" \
     --header="Content-Type: application/json" \
@@ -222,6 +228,10 @@ bot_registrar() {
         TOKEN=$(sed -n 's/.*"api_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$AUTH_FILE" | head -1)
       fi
       echo "[registrar] Found $(echo "$BOTS_WITH_INDEX" | wc -l) bot(s)"
+
+      # 缓存第一个 Bot ID 供 forward_message 使用
+      FIRST_BOT=$(echo "$BOTS_WITH_INDEX" | head -1 | sed -n 's/.*BotID:\s*\([a-zA-Z0-9@._-]*\).*/\1/p')
+      [ -n "$FIRST_BOT" ] && echo "$FIRST_BOT" > /tmp/active_bot_id
 
       echo "$BOTS_WITH_INDEX" | while IFS= read -r LINE; do
         # 提取索引 和 BotID

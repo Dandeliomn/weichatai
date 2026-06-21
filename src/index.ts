@@ -290,13 +290,21 @@ app.post('/webhook', async (req: Request, res: Response) => {
     );
 
     // 检查对应 Bot 是否已停用/删除，如果是则忽略消息
-    if (toUserName) {
-      const botCheck = await pgPool.query(
+    const checkBotId = toUserName || fromUserName;
+    if (checkBotId) {
+      // 先精确匹配 toUserName / fromUserName
+      let botCheck = await pgPool.query(
         'SELECT is_active, deleted_at FROM bot_accounts WHERE is_active = TRUE AND deleted_at IS NULL AND (bot_id = $1 OR wechat_id = $1) LIMIT 1',
-        [toUserName]
+        [checkBotId]
       );
+      // 如果 toUserName 为空，检查是否还有任何活跃 bot
+      if (botCheck.rows.length === 0 && !toUserName) {
+        botCheck = await pgPool.query(
+          'SELECT 1 FROM bot_accounts WHERE is_active = TRUE AND deleted_at IS NULL LIMIT 1'
+        );
+      }
       if (botCheck.rows.length === 0) {
-        console.log(`[Webhook] ⏭️ Bot ${toUserName} 已停用/删除，忽略消息`);
+        console.log(`[Webhook] ⏭️ 所有 Bot 已停用/删除，忽略消息 (from=${fromUserName})`);
         res.status(200).json({ reply: '' });
         return;
       }
