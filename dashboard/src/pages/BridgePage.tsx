@@ -229,7 +229,7 @@ export default function BridgePage() {
     if (st.running) {
       return (
         <Space size="small">
-          <Button size="small" type="primary" onClick={() => window.open('/st/', '_blank')}>
+          <Button size="small" type="primary" onClick={() => window.open('http://localhost:8082/', '_blank')}>
             聊天
           </Button>
           <Button size="small" danger onClick={() => handleStStop(bot.id)} loading={loading}>
