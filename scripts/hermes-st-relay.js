@@ -6,7 +6,7 @@
  *
  * Architecture:
  *   Hermes state.db (SQLite) → relay polls for new WeChat user messages
- *     → routes each message to correct ST instance via WebSocket
+ *     → routes each message to connected ST ChatBridge client via WebSocket SERVER
  *     → ST (ChatBridge) generates reply via DeepSeek/LLM
  *     → relay receives reply via same WebSocket
  *     → relay sends reply via iLink API back to WeChat
@@ -21,8 +21,7 @@
  * Environment:
  *   HERMES_STATE_DB       path to state.db (default: ~/.hermes/state.db)
  *   DATABASE_URL          PostgreSQL connection (default: localhost)
- *   ST_DEFAULT_URL        Default ST WebSocket base URL (default: ws://localhost:8080)
- *   ST_WS_PATH            ST WebSocket path (default: /ws)
+ *   RELAY_WS_PORT         WebSocket server port (default: 8850)
  *   POLL_INTERVAL         Poll interval in ms (default: 1000)
  *   MAPPING_REFRESH       Bot mapping refresh in ms (default: 30000)
  *   ILINK_BASE_URL        iLink API base URL (default: https://ilinkai.weixin.qq.com)
@@ -58,14 +57,12 @@ try {
 // ---------------------------------------------------------------------------
 const HERMES_DB = process.env.HERMES_STATE_DB || path.join(os.homedir(), '.hermes', 'state.db');
 const PG_URL = process.env.DATABASE_URL || 'postgresql://weclaw:weclaw_secret@localhost:5432/weclaw_companion';
-const ST_DEFAULT_BASE_URL = process.env.ST_DEFAULT_URL || 'ws://localhost:8080';
-const ST_WS_PATH = process.env.ST_WS_PATH || '/ws';
+const RELAY_WS_PORT = parseInt(process.env.RELAY_WS_PORT || '8850', 10);
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL || '1000', 10);
 const MAPPING_REFRESH_MS = parseInt(process.env.MAPPING_REFRESH || '30000', 10);
 const ILINK_BASE_URL = process.env.ILINK_BASE_URL || 'https://ilinkai.weixin.qq.com';
 const PINNED_BOT_ID = process.env.HERMES_BOT_ID || null;
 const CURSOR_CONFIG_KEY = 'hermes_st_relay_cursor';
-const MAX_RECONNECT_DELAY_MS = 60000; // 1 minute max backoff
 
 // ---------------------------------------------------------------------------
 // State
@@ -74,9 +71,13 @@ let pgPool = null;
 let hermesDb = null;
 let cursor = 0;
 let isRunning = true;
+let wss = null;
 
-// bot_id → { bot(account row), ws, character, stUrl, reconnectAttempts }
-const botConnections = new Map();
+// wechat_id → { ws, botId, charName } — connected ST ChatBridge clients
+const stClients = new Map();
+
+// bot_id → bot account info (for iLink send)
+const botStMap = new Map();
 
 // wechat_id → bot_id[] lookup for message routing
 const wechatIdToBotIds = new Map();
@@ -133,29 +134,13 @@ async function saveCursor(newCursor) {
   }
 }
 
-/**
- * Build the WebSocket target URL from a base URL.
- */
-function buildWsUrl(baseUrl) {
-  let url = baseUrl.trim();
-  // Convert http(s) to ws(s)
-  if (url.startsWith('http://')) url = 'ws://' + url.slice(7);
-  if (url.startsWith('https://')) url = 'wss://' + url.slice(8);
-  // Prevent double path
-  const hasPath = url.includes(ST_WS_PATH);
-  if (ST_WS_PATH && !hasPath) {
-    url = url.replace(/\/?$/, '') + ST_WS_PATH;
-  }
-  return url;
-}
-
 // ---------------------------------------------------------------------------
 // Bot → ST mapping
 // ---------------------------------------------------------------------------
 
 /**
  * Load bot mappings from PostgreSQL.
- * Returns an array of bot descriptors with their ST target URL.
+ * Returns an array of bot descriptors with their iLink connection info.
  */
 async function loadBotMappings() {
   try {
@@ -199,11 +184,6 @@ async function loadBotMappings() {
             example_dialogue: r.char_example_dialogue,
           }
         : null,
-      // ST URL: try per-bot env var, then default
-      st_url:
-        process.env[`ST_URL_${r.bot_index}`] ||
-        process.env[`ST_URL_${r.bot_id.replace(/[^a-zA-Z0-9]/g, '_')}`] ||
-        ST_DEFAULT_BASE_URL,
     }));
 
     // If PINNED_BOT_ID is set, filter to only that bot
@@ -212,7 +192,6 @@ async function loadBotMappings() {
     }
 
     // Only keep bots that have a character assigned (others can't use ST)
-    // but warn about bots without characters
     const withChar = bots.filter((b) => b.character);
     const withoutChar = bots.filter((b) => !b.character);
     if (withoutChar.length > 0) {
@@ -230,107 +209,64 @@ async function loadBotMappings() {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket connection management
+// WebSocket Server (ST ChatBridge connects to us)
 // ---------------------------------------------------------------------------
 
 /**
- * Connect to one ST instance via WebSocket.
- * Registers event handlers for message, close, error with auto-reconnect.
+ * Start WebSocket server for ST ChatBridge clients to connect to.
  */
-function connectToST(bot) {
-  const { bot_id, st_url, character, nickname } = bot;
-  const wsUrl = buildWsUrl(st_url);
+function startWSServer() {
+  wss = new WebSocket.Server({ port: RELAY_WS_PORT });
 
-  // Track connection state in the map entry
-  let entry = botConnections.get(bot_id);
-  if (!entry) {
-    entry = { bot, ws: null, character, stUrl: st_url, reconnectAttempts: 0 };
-    botConnections.set(bot_id, entry);
-  }
-  entry.bot = bot;
-  entry.character = character;
+  console.log(`[relay] WebSocket server listening on :${RELAY_WS_PORT}`);
 
-  console.log(`[Relay] 🔌 Connecting to ST: bot=${bot_id} url=${wsUrl}`);
+  wss.on('connection', (ws) => {
+    let clientInfo = null;
 
-  let ws;
-  try {
-    ws = new WebSocket(wsUrl);
-  } catch (e) {
-    console.error(`[Relay] ❌ WebSocket construction failed for ${bot_id}:`, e.message);
-    scheduleReconnect(bot_id);
-    return null;
-  }
+    ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
 
-  ws.on('open', () => {
-    console.log(`[Relay] ✅ ST WebSocket connected: bot=${bot_id} (${nickname || bot_id})`);
-    entry.reconnectAttempts = 0;
-
-    // Send identify message so ST knows which bot/character this is
-    const identify = {
-      type: 'identify',
-      bot_id: bot_id,
-      character: character
-        ? {
-            id: character.id,
-            name: character.name,
-            tagline: character.tagline,
+        if (msg.type === 'identify') {
+          // ST ChatBridge registers itself
+          clientInfo = {
+            botId: msg.bot_id,
+            wechatId: msg.wechat_id,
+            charName: msg.char_name || 'unknown',
+          };
+          stClients.set(msg.wechat_id, { ws, ...clientInfo });
+          console.log(`[relay] ST client registered: ${msg.char_name} (${msg.wechat_id})`);
+        } else if (msg.type === 'reply') {
+          // ST generated a reply → send via iLink
+          const botId = clientInfo?.botId || msg.bot_id;
+          const botMapping = botStMap.get(botId);
+          if (botMapping) {
+            console.log(
+              `[Relay] 📩 ← ST: bot=${botId} from=${msg.user_id} "${(msg.content || '').substring(0, 40)}..."`
+            );
+            sendViaILink(botMapping, msg);
+          } else {
+            console.warn(`[Relay] No bot mapping for bot_id=${botId}, cannot send iLink reply`);
           }
-        : null,
-    };
-    safeWsSend(ws, identify);
+        }
+      } catch (e) {
+        // skip malformed messages
+      }
+    });
+
+    ws.on('close', () => {
+      if (clientInfo) {
+        stClients.delete(clientInfo.wechatId);
+        console.log(`[relay] ST client disconnected: ${clientInfo.charName}`);
+      }
+    });
+
+    ws.on('error', (err) => {
+      console.error(`[relay] WS client error:`, err.message);
+    });
   });
 
-  ws.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      handleSTReply(bot_id, msg);
-    } catch (e) {
-      console.error(`[Relay] Invalid ST message from ${bot_id}:`, e.message);
-    }
-  });
-
-  ws.on('close', (code, reason) => {
-    console.log(
-      `[Relay] ST disconnected: bot=${bot_id} code=${code} reason=${reason || 'unknown'}`
-    );
-    entry.ws = null;
-    if (isRunning) {
-      scheduleReconnect(bot_id);
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error(`[Relay] ST WebSocket error: bot=${bot_id}`, err.message);
-    // `close` will fire after `error`, which triggers reconnect
-  });
-
-  entry.ws = ws;
-  return ws;
-}
-
-/**
- * Schedule reconnection with exponential backoff.
- */
-function scheduleReconnect(botId) {
-  if (!isRunning) return;
-  const entry = botConnections.get(botId);
-  if (!entry) return;
-
-  entry.reconnectAttempts = (entry.reconnectAttempts || 0) + 1;
-  const delay = Math.min(
-    1000 * Math.pow(2, entry.reconnectAttempts - 1),
-    MAX_RECONNECT_DELAY_MS
-  );
-
-  console.log(
-    `[Relay] 🔄 Reconnecting ${botId} in ${delay}ms (attempt ${entry.reconnectAttempts})`
-  );
-
-  setTimeout(() => {
-    if (isRunning && botConnections.has(botId)) {
-      connectToST(entry.bot);
-    }
-  }, delay);
+  return wss;
 }
 
 /**
@@ -353,31 +289,16 @@ function safeWsSend(ws, obj) {
 
 /**
  * Refresh bot→ST mappings from the database.
- * Opens new connections for newly configured bots and drops removed ones.
+ * Rebuilds the botStMap and wechatIdToBotIds lookup tables.
  */
 async function refreshMappings() {
   try {
     const mappings = await loadBotMappings();
-    const currentIds = new Set(mappings.map((m) => m.bot_id));
-    const connectedIds = new Set(botConnections.keys());
 
-    // Close connections for bots that are no longer in the mapping
-    for (const botId of connectedIds) {
-      if (!currentIds.has(botId)) {
-        console.log(`[Relay] Removing bot mapping: ${botId}`);
-        const entry = botConnections.get(botId);
-        if (entry.ws && entry.ws.readyState === WebSocket.OPEN) {
-          try { entry.ws.close(); } catch { /* ignore */ }
-        }
-        botConnections.delete(botId);
-      }
-    }
-
-    // Open connections for new bots
+    // Rebuild botStMap (bot_id → bot info for iLink)
+    botStMap.clear();
     for (const mapping of mappings) {
-      if (!connectedIds.has(mapping.bot_id)) {
-        connectToST(mapping);
-      }
+      botStMap.set(mapping.bot_id, mapping);
     }
 
     // Rebuild wechat_id → bot_id lookup map for message routing
@@ -394,7 +315,7 @@ async function refreshMappings() {
     }
 
     console.log(
-      `[Relay] Bot mappings: ${botConnections.size} connected (${mappings.length} configured)`
+      `[Relay] Bot mappings: ${botStMap.size} configured (${stClients.size} ST clients connected)`
     );
   } catch (e) {
     console.error('[Relay] Failed to refresh mappings:', e.message);
@@ -451,33 +372,27 @@ async function pollMessages() {
       }
 
       for (const botId of targetBotIds) {
-        const entry = botConnections.get(botId);
-        if (!entry || !entry.ws || entry.ws.readyState !== WebSocket.OPEN) continue;
-
-        const request = {
-          type: 'message',
-          user_id: wechatId,
-          nickname: '', // state.db does not store sender nickname
-          content: content,
-          media_type: 'text',
-          bot_id: botId,
-          timestamp: Math.floor(timestamp),
-          context: {
-            recent_history: [],
-            emotion: { label: 'neutral', confidence: 0.5 },
-            memories: [],
-          },
-          status: { typing: false, read: true },
-        };
-
-        const sent = safeWsSend(entry.ws, request);
-        if (sent) {
+        // Route message to connected ST client (by wechat_id)
+        const stClient = stClients.get(wechatId);
+        if (stClient && stClient.ws.readyState === WebSocket.OPEN) {
+          const payload = {
+            type: 'user_request',
+            user_id: wechatId,
+            bot_id: stClient.botId,
+            content: {
+              messages: [
+                { role: 'user', content: content }
+              ]
+            },
+            timestamp: Math.floor(timestamp),
+          };
+          stClient.ws.send(JSON.stringify(payload));
           console.log(
-            `[Relay] 📤 → ST: bot=${botId} user=${wechatId} "${content.substring(0, 40)}..."`
+            `[Relay] 📩 Relayed to ST: bot=${botId} user=${wechatId} "${content.substring(0, 40)}..."`
           );
         } else {
           console.warn(
-            `[Relay] ⚠️ Cannot forward (WS not open): bot=${botId}`
+            `[Relay] ⚠️ Cannot forward (ST not connected for wechat_id=${wechatId})`
           );
         }
       }
@@ -492,27 +407,6 @@ async function pollMessages() {
   }
 }
 
-/**
- * Handle a reply or action received from ST via WebSocket.
- */
-async function handleSTReply(botId, msg) {
-  if (msg.type !== 'reply' && msg.type !== 'message') return;
-  if (msg.type === 'message' && !msg.content) return;
-
-  const { user_id, content, action } = msg;
-  if (!user_id || !content) {
-    console.warn(`[Relay] Incomplete ST reply from ${botId}:`, JSON.stringify(msg));
-    return;
-  }
-
-  console.log(
-    `[Relay] 📩 ← ST: bot=${botId} from=${user_id} "${content.substring(0, 40)}..."`
-  );
-
-  // Send the reply back to WeChat via iLink API
-  await sendViaILink(botId, user_id, content);
-}
-
 // ---------------------------------------------------------------------------
 // iLink API
 // ---------------------------------------------------------------------------
@@ -520,22 +414,26 @@ async function handleSTReply(botId, msg) {
 /**
  * Send a message via the iLink sendmessage API.
  * Matches the same format used in src/utils/weclawClient.ts.
+ * @param {Object} botMapping - Bot account info from botStMap
+ * @param {Object} msg - Reply message { user_id, content, ... }
  */
-async function sendViaILink(botId, toUserId, text) {
-  const entry = botConnections.get(botId);
-  if (!entry) {
-    console.warn(`[Relay] No bot entry for ${botId}, cannot send iLink message`);
+async function sendViaILink(botMapping, msg) {
+  const botId = botMapping.bot_id;
+  const toUserId = msg.user_id;
+  const text = msg.content;
+
+  if (!toUserId || !text) {
+    console.warn(`[Relay] Incomplete reply for bot ${botId}:`, JSON.stringify(msg));
     return;
   }
 
-  const bot = entry.bot;
-  const token = bot.bot_token || bot.api_token;
+  const token = botMapping.bot_token || botMapping.api_token;
   if (!token) {
     console.warn(`[Relay] No token for bot ${botId}, cannot send iLink message`);
     return;
   }
 
-  const baseUrl = bot.ilink_base_url || ILINK_BASE_URL;
+  const baseUrl = botMapping.ilink_base_url || ILINK_BASE_URL;
   const url = `${baseUrl}/ilink/bot/sendmessage`;
 
   const body = JSON.stringify({
@@ -590,15 +488,22 @@ async function shutdown(signal) {
   console.log(`\n[Relay] Shutting down (${signal})...`);
   isRunning = false;
 
-  // Close all WebSocket connections
-  for (const [botId, entry] of botConnections) {
-    if (entry.ws) {
+  // Close all ST client WebSocket connections
+  for (const [wechatId, client] of stClients) {
+    if (client.ws) {
       try {
-        entry.ws.close();
+        client.ws.close();
       } catch { /* ignore */ }
     }
   }
-  botConnections.clear();
+  stClients.clear();
+
+  // Close WebSocket server
+  if (wss) {
+    try {
+      wss.close();
+    } catch { /* ignore */ }
+  }
 
   // Close PostgreSQL pool
   if (pgPool) {
@@ -632,7 +537,7 @@ async function main() {
   console.log('='.repeat(60));
   console.log(`  Hermes DB:     ${HERMES_DB}`);
   console.log(`  PostgreSQL:    ${PG_URL.replace(/\/\/.*@/, '//***@')}`);
-  console.log(`  ST default:    ${ST_DEFAULT_BASE_URL}${ST_WS_PATH}`);
+  console.log(`  WS Server:     :${RELAY_WS_PORT}`);
   console.log(`  Poll interval: ${POLL_INTERVAL_MS}ms`);
   console.log(`  Bot refresh:   ${MAPPING_REFRESH_MS}ms`);
   console.log(`  Mode:          ${isOnce ? 'once' : 'continuous'}${catchUp ? ' (catch-up)' : ''}`);
@@ -674,9 +579,12 @@ async function main() {
   // Load initial bot mappings
   await refreshMappings();
 
-  if (botConnections.size === 0) {
+  if (botStMap.size === 0) {
     console.log('[Relay] ⚠️  No bots with characters configured. Waiting for bot registration...');
   }
+
+  // Start WebSocket server for ST ChatBridge clients
+  startWSServer();
 
   // Periodic mapping refresh
   if (!isOnce) {
