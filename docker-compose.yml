@@ -7,37 +7,6 @@ name: wechat-companion
 
 services:
   # ===========================================================================
-  # WeClaw 微信桥接层 - 处理微信扫码登录、消息收发
-  # 基于 WeClawBot-API (https://github.com/Cp0204/WeClawBot-API)
-  # 使用 expect(unbuffer) 提供伪终端以捕获 incoming 消息
-  # ===========================================================================
-  weclaw-bridge:
-    profiles: ["disabled"]  # Hermes 接管
-    build:
-      context: .
-      dockerfile: weclaw-bridge.Dockerfile
-    container_name: weclaw-bridge
-    tty: true
-    stdin_open: true
-    ports:
-      - "26322:26322"
-    environment:
-      - QR_DIR=/qr-share
-    volumes:
-      - weclaw_config:/app/config
-      - ./bridge-forward.sh:/bridge-forward.sh:ro
-      - qr_share:/qr-share
-    restart: unless-stopped
-    networks:
-      - companion-net
-    healthcheck:
-      test: ["CMD", "pgrep", "-f", "weclawbot-api"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-
-  # ===========================================================================
   # 主应用 - Express API 服务器
   # 接收WeClaw转发消息，将任务入队，返回占位回复
   # ===========================================================================
@@ -81,69 +50,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
-
-  # ===========================================================================
-  # BullMQ Worker - 异步处理消息队列
-  # 独立进程: 读取短期记忆、长期记忆、情绪分析、调用DeepSeek、发送回复
-  # ===========================================================================
-  bull-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: weclaw-bull-worker
-    command: ["node", "--max-old-space-size=4096", "dist/worker.js"]
-    env_file:
-      - .env
-    environment:
-      - NODE_ENV=production
-      - ILINK_POLLING_ENABLED=true
-    volumes:
-      - uploads_data:/app/uploads
-      - ./stickers:/app/stickers
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'node.*worker' || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    networks:
-      - companion-net
-    deploy:
-      resources:
-        limits:
-          memory: 5G
-
-  # ===========================================================================
-  # 主动关怀定时任务 - 每天8:00/13:00/20:00发送关怀消息
-  # ===========================================================================
-  care-scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: weclaw-care-scheduler
-    command: ["node", "dist/care/scheduler.js"]
-    env_file:
-      - .env
-    environment:
-      - NODE_ENV=production
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'node.*scheduler' || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - companion-net
 
   # ===========================================================================
   # Redis - 短期记忆存储 + BullMQ 队列后端
@@ -250,55 +156,6 @@ services:
 
 
   # ===========================================================================
-  # 微信二维码桥接服务 - QR码展示 (从 qr_share 卷读取)
-  # 将 weclaw-bridge 输出的终端 QR 文本转为 SVG/HTML
-  # ===========================================================================
-  weixin-bridge:
-    profiles: ["disabled"]  # Hermes 接管
-    image: node:20-alpine
-    container_name: weixin-bridge
-    working_dir: /app
-    command: ["node", "index.js"]
-    environment:
-      - PORT=3001
-      - QR_DIR=/qr-share
-    volumes:
-      - ./weixin-bridge-index.js:/app/index.js:ro
-      - qr_share:/qr-share:ro
-    restart: unless-stopped
-    networks:
-      - companion-net
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O-", "http://localhost:3001/health"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-
-  # ===========================================================================
-  # FastAgent - WeChat 消息收发 (支持webhook转发)
-  # ===========================================================================
-  fastagent:
-    profiles: ["disabled"]  # Hermes 接管
-    build:
-      context: .
-      dockerfile: fastagent.Dockerfile
-    container_name: weclaw-fastagent
-    ports:
-      - "18789:18789"
-    volumes:
-      - fastagent_data:/app/data
-      - ./fastagent-config.json:/app/config/config.json:ro
-    environment:
-      - IM_GATEWAY_ALLOW_ALL_PERMISSIONS=true
-      - IM_GATEWAY_WORKSPACE_DIR=/app/data
-      - IM_GATEWAY_DATA_DIR=/app/data
-      - IM_GATEWAY_AGENT_ID=companion
-    restart: unless-stopped
-    networks:
-      - companion-net
-
-  # ===========================================================================
   # Hermes Agent - 微信消息处理 + AI角色扮演
   # 替换 FastAgent + api-server 消息链路
   # ===========================================================================
@@ -325,21 +182,6 @@ services:
       - companion-net
 
   # ===========================================================================
-  # OpeniLink Hub - 微信桥接管理平台 (支持webhook)
-  # Web UI: http://localhost:9800
-  # ===========================================================================
-  openilink-hub:
-    image: ghcr.io/openilink/openilink-hub:latest
-    container_name: weclaw-openilink
-    ports:
-      - "9800:9800"
-    volumes:
-      - openilink_data:/var/lib/openilink-hub
-    restart: unless-stopped
-    networks:
-      - companion-net
-
-  # ===========================================================================
   # Dashboard - React Admin SPA
   # ===========================================================================
   dashboard:
@@ -357,20 +199,11 @@ services:
 # 持久化卷
 # =============================================================================
 volumes:
-  openilink_data:
-    driver: local
-
-  fastagent_data:
-    driver: local
   hermes_data:
     driver: local
   redis_data:
     driver: local
   postgres_data:
-    driver: local
-  weclaw_config:
-    driver: local
-  qr_share:
     driver: local
   api_data:
     driver: local
