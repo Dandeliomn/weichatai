@@ -1,0 +1,24 @@
+# =============================================================================
+# SillyTavern Docker Compose - 基础部署
+# ST Web UI 通过 Nginx 反向代理在 :8080/st/ 访问
+# =============================================================================
+
+services:
+  st-default:
+    image: ghcr.io/sillytavern/sillytavern:latest
+    container_name: weclaw-st-default
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - ./st-data/default/data:/home/node/app/data
+      - ./st-data/default/config:/home/node/app/config
+    environment:
+      - STORAGE_PATH=/home/node/app/data
+    restart: unless-stopped
+    networks:
+      - companion-net
+
+networks:
+  companion-net:
+    external: true
+    name: weclaw-companion-net

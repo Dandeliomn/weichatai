@@ -11,3 +11,7 @@ __pycache__/
 .idea/
 fastagent-data/
 .superpowers/
+
+# SillyTavern auto-generated data
+st-data/default/data/
+st-data/default/config/cookie-secret.txt
