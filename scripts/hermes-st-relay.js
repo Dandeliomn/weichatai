@@ -71,11 +71,15 @@ const MAX_RECONNECT_DELAY_MS = 60000; // 1 minute max backoff
 // State
 // ---------------------------------------------------------------------------
 let pgPool = null;
+let hermesDb = null;
 let cursor = 0;
 let isRunning = true;
 
 // bot_id → { bot(account row), ws, character, stUrl, reconnectAttempts }
 const botConnections = new Map();
+
+// wechat_id → bot_id[] lookup for message routing
+const wechatIdToBotIds = new Map();
 
 // ---------------------------------------------------------------------------
 // Database helpers
@@ -87,10 +91,9 @@ const botConnections = new Map();
 function initDB() {
   pgPool = new Pool({ connectionString: PG_URL, max: 5 });
 
-  // Verify Hermes state.db is accessible
+  // Open and keep Hermes state.db connection for the process lifetime
   try {
-    const sqlite = sqlite3(HERMES_DB, { readonly: true });
-    sqlite.close();
+    hermesDb = sqlite3(HERMES_DB, { readonly: true });
     console.log(`[Relay] ✅ Hermes state.db: ${HERMES_DB}`);
   } catch (e) {
     console.error(`[Relay] ❌ Cannot open Hermes state.db at ${HERMES_DB}:`, e.message);
@@ -126,7 +129,7 @@ async function saveCursor(newCursor) {
       [String(newCursor)]
     );
   } catch (e) {
-    // Non-critical; cursor will be re-derived on next poll.
+    console.error(`[Relay] Failed to save cursor ${newCursor}:`, e.message);
   }
 }
 
@@ -377,6 +380,19 @@ async function refreshMappings() {
       }
     }
 
+    // Rebuild wechat_id → bot_id lookup map for message routing
+    wechatIdToBotIds.clear();
+    for (const mapping of mappings) {
+      if (mapping.wechat_id) {
+        const existing = wechatIdToBotIds.get(mapping.wechat_id);
+        if (existing) {
+          existing.push(mapping.bot_id);
+        } else {
+          wechatIdToBotIds.set(mapping.wechat_id, [mapping.bot_id]);
+        }
+      }
+    }
+
     console.log(
       `[Relay] Bot mappings: ${botConnections.size} connected (${mappings.length} configured)`
     );
@@ -393,11 +409,13 @@ async function refreshMappings() {
  * Poll Hermes state.db for new WeChat user messages and forward to ST.
  */
 async function pollMessages() {
-  let sqlite;
-  try {
-    sqlite = sqlite3(HERMES_DB, { readonly: true });
+  if (!hermesDb) {
+    console.error('[Relay] Hermes DB not initialized');
+    return;
+  }
 
-    const msgs = sqlite
+  try {
+    const msgs = hermesDb
       .prepare(
         `
         SELECT m.id, m.role, m.content, m.timestamp, s.user_id
@@ -425,13 +443,16 @@ async function pollMessages() {
       }
       if (id > maxId) maxId = id;
 
-      // Forward to every connected ST instance
-      if (botConnections.size === 0) {
+      // Route message to the correct bot(s) by wechat_id
+      const targetBotIds = wechatIdToBotIds.get(wechatId);
+      if (!targetBotIds || targetBotIds.length === 0) {
+        console.log(`[Relay] No bot mapping for wechat_id=${wechatId}, skipping message`);
         continue;
       }
 
-      for (const [botId, entry] of botConnections) {
-        if (!entry.ws || entry.ws.readyState !== WebSocket.OPEN) continue;
+      for (const botId of targetBotIds) {
+        const entry = botConnections.get(botId);
+        if (!entry || !entry.ws || entry.ws.readyState !== WebSocket.OPEN) continue;
 
         const request = {
           type: 'message',
@@ -468,8 +489,6 @@ async function pollMessages() {
     console.log(`[Relay] Polled: ${msgs.length} msgs, cursor=${cursor}`);
   } catch (e) {
     console.error('[Relay] Poll error:', e.message);
-  } finally {
-    if (sqlite) sqlite.close();
   }
 }
 
@@ -588,6 +607,13 @@ async function shutdown(signal) {
     } catch { /* ignore */ }
   }
 
+  // Close Hermes SQLite connection
+  if (hermesDb) {
+    try {
+      hermesDb.close();
+    } catch { /* ignore */ }
+  }
+
   console.log('[Relay] Goodbye');
   process.exit(0);
 }
@@ -625,8 +651,7 @@ async function main() {
     const fiveMinAgo = now - 300;
     // Find the first message id newer than 5 min ago
     try {
-      const sqlite = sqlite3(HERMES_DB, { readonly: true });
-      const row = sqlite
+      const row = hermesDb
         .prepare(
           `
           SELECT MIN(m.id) as id
@@ -640,7 +665,6 @@ async function main() {
         cursor = row.id - 1; // start just before this message
         console.log(`[Relay] First run, fast-forwarding cursor to ~5 min ago (id=${cursor})`);
       }
-      sqlite.close();
     } catch (e) {
       console.warn('[Relay] Could not fast-forward cursor:', e.message);
     }
