@@ -1,0 +1,11 @@
+# -- ST config override --
+whitelistMode: true
+listen: true
+port: 8000
+enableForwardedWhitelist: true
+whitelist:
+  - 172.18.0.0/16
+  - 172.18.0.1
+  - ::1
+  - 127.0.0.1
+whitelistDockerHosts: true

@@ -57,6 +57,13 @@ services:
       - api_data:/app/data
       - uploads_data:/app/uploads
       - ./stickers:/app/stickers
+      - ./st-data:/app/st-data
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Docker CLI (bind-mount to avoid glibc/musl conflict)
+      - /usr/bin/docker:/usr/local/bin/docker:ro
+      - /lib64/ld-linux-x86-64.so.2:/lib64/ld-linux-x86-64.so.2:ro
+      - /usr/lib/x86_64-linux-gnu/libc.so.6:/usr/lib/x86_64-linux-gnu/libc.so.6:ro
+      - /usr/libexec/docker/cli-plugins/docker-compose:/usr/local/lib/docker/cli-plugins/docker-compose:ro
       # fastagent_data removed (Hermes replaces FastAgent)
     restart: unless-stopped
     depends_on:

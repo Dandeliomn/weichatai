@@ -23,6 +23,15 @@ interface BotInfo {
   character: CharacterBrief | null;
 }
 
+interface StStatus {
+  ok: boolean;
+  running: boolean;
+  state: { Status: string };
+  containerName?: string;
+  image?: string;
+  ports?: string;
+}
+
 export default function BridgePage() {
   const { user } = useAuth();
   const screens = useBreakpoint();
@@ -36,9 +45,17 @@ export default function BridgePage() {
   const [togglingId, setTogglingId] = useState<number | null>(null);
   const [changingId, setChangingId] = useState<number | null>(null);
   const [qrTs, setQrTs] = useState(Date.now());
+  const [stStatuses, setStStatuses] = useState<Record<number, StStatus | null>>({});
+  const [stLoadingId, setStLoadingId] = useState<number | null>(null);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const notifiedRef = useRef(false);
   const prevBotIds = useRef<Set<number>>(new Set());
+  const botsRef = useRef<BotInfo[]>(bots);
+
+  // keep botsRef in sync
+  useEffect(() => {
+    botsRef.current = bots;
+  }, [bots]);
 
   // 加载可用角色列表
   const loadCharacters = async () => {
@@ -82,6 +99,66 @@ export default function BridgePage() {
     return () => { if (pollingRef.current) clearInterval(pollingRef.current); };
   }, []);
 
+  // ── ST 实例状态查询 ──
+  const fetchStStatus = async (botId: number) => {
+    try {
+      const res = await api.get(`/api/st/bots/${botId}/status`);
+      setStStatuses(prev => ({ ...prev, [botId]: res.data }));
+    } catch {
+      setStStatuses(prev => ({ ...prev, [botId]: null }));
+    }
+  };
+
+  // ── ST 实例控制 ──
+  const handleStStart = async (botId: number) => {
+    setStLoadingId(botId);
+    try {
+      await api.post(`/api/st/bots/${botId}/start`);
+      message.success('ST 实例已启动');
+      setTimeout(() => fetchStStatus(botId), 1000);
+    } catch (err: any) {
+      message.error(err.response?.data?.error || '启动失败');
+    }
+    setStLoadingId(null);
+  };
+
+  const handleStStop = async (botId: number) => {
+    setStLoadingId(botId);
+    try {
+      await api.post(`/api/st/bots/${botId}/stop`);
+      message.success('ST 实例已停止');
+      setTimeout(() => fetchStStatus(botId), 1000);
+    } catch (err: any) {
+      message.error(err.response?.data?.error || '停止失败');
+    }
+    setStLoadingId(null);
+  };
+
+  const handleStCreate = async (botId: number) => {
+    setStLoadingId(botId);
+    try {
+      await api.post(`/api/st/bots/${botId}/create`);
+      message.success('ST 实例已创建');
+      setTimeout(() => fetchStStatus(botId), 2000);
+    } catch (err: any) {
+      message.error(err.response?.data?.error || '创建失败');
+    }
+    setStLoadingId(null);
+  };
+
+  // ── ST 状态轮询（每 10 秒） ──
+  const botIdsKey = bots.map(b => b.id).sort().join(',');
+  useEffect(() => {
+    if (bots.length === 0) {
+      setStStatuses({});
+      return;
+    }
+    const doFetch = () => botsRef.current.forEach(b => fetchStStatus(b.id));
+    doFetch();
+    const stInterval = setInterval(doFetch, 10000);
+    return () => clearInterval(stInterval);
+  }, [botIdsKey]);
+
   // 换角色
   const handleChangeChar = async (botId: number, characterId: number) => {
     setChangingId(botId);
@@ -120,6 +197,54 @@ export default function BridgePage() {
       message.error(err.response?.data?.error || '删除失败');
     }
     setDeletingId(null);
+  };
+
+  // ── ST 状态标签 ──
+  const renderStStatusTag = (bot: BotInfo) => {
+    const st = stStatuses[bot.id];
+    if (st === undefined) return <Tag>ST:...</Tag>;
+    if (st === null || st.state?.Status === 'not_found') return <Tag>ST:未创建</Tag>;
+    return st.running
+      ? <Tag color="green">ST:运行中</Tag>
+      : <Tag color="red">ST:已停止</Tag>;
+  };
+
+  // ── ST 操作按钮 ──
+  const renderStControls = (bot: BotInfo) => {
+    const st = stStatuses[bot.id];
+    const loading = stLoadingId === bot.id;
+
+    if (st === undefined) return null;
+
+    // 未创建
+    if (st === null || st.state?.Status === 'not_found') {
+      return (
+        <Button size="small" onClick={() => handleStCreate(bot.id)} loading={loading}>
+          创建ST实例
+        </Button>
+      );
+    }
+
+    // 运行中
+    if (st.running) {
+      return (
+        <Space size="small">
+          <Button size="small" type="primary" onClick={() => window.open('/st/', '_blank')}>
+            聊天
+          </Button>
+          <Button size="small" danger onClick={() => handleStStop(bot.id)} loading={loading}>
+            停止
+          </Button>
+        </Space>
+      );
+    }
+
+    // 已停止
+    return (
+      <Button size="small" onClick={() => handleStStart(bot.id)} loading={loading}>
+        启动
+      </Button>
+    );
   };
 
   const botActions = (bot: BotInfo) => (
@@ -222,6 +347,7 @@ export default function BridgePage() {
                 <Tag color={bot.is_active ? 'green' : 'default'}>
                   {bot.is_active ? 'Active' : 'Inactive'}
                 </Tag>
+                {renderStStatusTag(bot)}
               </Space>
             }
             extra={
@@ -238,6 +364,10 @@ export default function BridgePage() {
             )}
             <div style={{ marginTop: 8 }}>
               {botActions(bot)}
+            </div>
+            {/* ST 实例控制 */}
+            <div style={{ marginTop: 8, borderTop: '1px solid #f0f0f0', paddingTop: 8 }}>
+              {renderStControls(bot)}
             </div>
           </Card>
         ))

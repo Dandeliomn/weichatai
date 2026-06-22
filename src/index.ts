@@ -28,6 +28,7 @@ import adminRouter, { initAdminRoutes } from './routes/admin';
 import importRouter, { initImportRoutes } from './routes/import';
 import characterRouter, { initCharacterRoutes } from './routes/characters';
 import bridgeRouter, { initBridgeRoutes } from './routes/bridge';
+import stManager from './routes/st-manager';
 
 // =============================================================================
 // 配置常量
@@ -567,6 +568,7 @@ app.use('/api/admin', adminRouter);
 app.use('/api/import', importRouter);
 app.use('/api/characters', characterRouter);
 app.use('/api', bridgeRouter);
+app.use('/api/st', stManager);
 
 // =============================================================================
 // 404 处理

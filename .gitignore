@@ -15,3 +15,4 @@ fastagent-data/
 # SillyTavern auto-generated data
 st-data/default/data/
 st-data/default/config/cookie-secret.txt
+config.json

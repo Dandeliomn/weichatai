@@ -8,6 +8,9 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
+# 安装编译工具（better-sqlite3 需要 python3/make/gcc）
+RUN apk add --no-cache python3 make gcc g++
+
 # 复制依赖文件
 COPY package.json package-lock.json* ./
 
