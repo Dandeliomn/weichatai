@@ -12,6 +12,7 @@ services:
       - "127.0.0.1:8001:8000"
     volumes:
       - ./st-data/24926e2e3aa4-im-bot:/home/node/app/data
+      - ./st-data/24926e2e3aa4-im-bot/data/default-user/extensions/SillyTavern-Extension-ChatBridge:/home/node/app/public/scripts/extensions/third-party/SillyTavern-Extension-ChatBridge
     environment:
       - STORAGE_PATH=/home/node/app/data
     labels:

@@ -79,6 +79,7 @@ async function main() {
         lines.push(`    volumes:`);
         lines.push(`      - ./st-data/${sid}/data:/home/node/app/data`);
         lines.push(`      - ./st-data/${sid}/config:/home/node/app/config`);
+        lines.push(`      - ./st-data/${sid}/data/default-user/extensions/SillyTavern-Extension-ChatBridge:/home/node/app/public/scripts/extensions/third-party/SillyTavern-Extension-ChatBridge`);
         lines.push(`    environment:`);
         lines.push(`      - STORAGE_PATH=/home/node/app/data`);
         lines.push(`    labels:`);
