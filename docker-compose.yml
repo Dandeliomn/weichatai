@@ -21,7 +21,6 @@ services:
       - .env
     environment:
       - NODE_ENV=production
-      - ILINK_POLLING_ENABLED=true
     volumes:
       - api_data:/app/data
       - uploads_data:/app/uploads
