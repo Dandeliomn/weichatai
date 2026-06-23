@@ -337,6 +337,53 @@ async function refreshMappings() {
  * Detect and handle memory correction requests from user.
  * Spawns memory-correct.js asynchronously.
  */
+// ---------------------------------------------------------------------------
+// she-love-me relationship analysis trigger
+// ---------------------------------------------------------------------------
+
+function handleRelationshipAnalysis(content, wechatId, botId) {
+  const charName = botStMap.get(botId)?.character_name || '王静';
+  console.log(`[Relay] 📊 Relationship analysis requested: bot=${botId}`);
+
+  const { spawn } = require('child_process');
+  const toolPath = path.join(__dirname, 'love-analysis.js');
+  const promptPath = `/tmp/love_analysis_${Date.now()}.md`;
+  const child = spawn('node', [toolPath, '-c', charName, '-o', promptPath], {
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  child.on('close', (code) => {
+    (async () => {
+      console.log(`[Relay] Analysis prompt generated (exit ${code}): ${promptPath}`);
+
+      const botMapping = botStMap.get(botId);
+      if (botMapping && code === 0) {
+        try {
+          // Send acknowledgment
+          await sendViaILink(botMapping, {
+            type: 'reply',
+            bot_id: botId,
+            user_id: wechatId,
+            content: '正在分析你们的聊天记录...稍等片刻 🔍',
+            action: 'send_message',
+          });
+
+          // TODO: Feed prompt to AI and send analysis result
+          // For now, generate the prompt and save it
+          console.log(`[Relay] Analysis prompt ready: ${promptPath}`);
+        } catch (e) {
+          console.error('[Relay] Analysis ack failed:', e.message);
+        }
+      }
+    })();
+  });
+
+  child.on('error', (err) => {
+    console.error(`[Relay] Analysis spawn error:`, err.message);
+  });
+}
+
 function handleMemoryCorrection(content, wechatId, botId) {
   const charName = botStMap.get(botId)?.character_name || '王静';
   const claim = content.replace(/'/g, "'\\''");
@@ -435,10 +482,16 @@ async function pollMessages() {
       }
 
       for (const botId of targetBotIds) {
-        // Check for memory correction intent before forwarding to ST
+        // Check for memory correction intent
         const correctionPattern = /(?:这段|那个|这个|那里|这里).*(?:不对|不是|错了|记错)|(?:其实|应该是).+|^不对|^错了|^记错|纠正|更正|改一下/;
         if (correctionPattern.test(content)) {
           handleMemoryCorrection(content, wechatId, botId);
+        }
+
+        // Check for relationship analysis request
+        const analysisPattern = /分析|关系|怎么样|她.*我|我.*她|爱.*不爱|喜欢.*不.*喜欢|情感|感情/;
+        if (analysisPattern.test(content) && content.length < 30) {
+          handleRelationshipAnalysis(content, wechatId, botId);
         }
 
         // Route message to connected ST client (by wechat_id)

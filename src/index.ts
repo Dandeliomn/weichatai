@@ -569,6 +569,8 @@ app.use('/api/import', importRouter);
 app.use('/api/characters', characterRouter);
 app.use('/api', bridgeRouter);
 app.use('/api/st', stManager);
+import initCorrectionRoutes from './routes/correction';
+app.use('/api/memory', initCorrectionRoutes(pgPool));
 
 // =============================================================================
 // 404 处理
