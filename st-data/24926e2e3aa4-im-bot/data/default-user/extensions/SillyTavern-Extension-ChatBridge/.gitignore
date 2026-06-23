@@ -1,0 +1,9 @@
+*.secret
+settings.json
+.settings.json
+*.old
+olds
+settings.json
+SECRET/
+apicheck.py
+apiTest.py
