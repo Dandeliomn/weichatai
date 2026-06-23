@@ -329,6 +329,69 @@ async function refreshMappings() {
 /**
  * Poll Hermes state.db for new WeChat user messages and forward to ST.
  */
+// ---------------------------------------------------------------------------
+// Memory self-evolution: correction detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect and handle memory correction requests from user.
+ * Spawns memory-correct.js asynchronously.
+ */
+function handleMemoryCorrection(content, wechatId, botId) {
+  const charName = botStMap.get(botId)?.character_name || '王静';
+  const claim = content.replace(/'/g, "'\\''");
+
+  console.log(`[Relay] 🔧 Memory correction detected: bot=${botId} claim="${content.substring(0, 40)}..."`);
+
+  // Spawn correction tool asynchronously (non-blocking)
+  const { spawn } = require('child_process');
+  const toolPath = path.join(__dirname, 'memory-correct.js');
+  const child = spawn('node', [toolPath, '-c', charName, '-m', content], {
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let result = '';
+  child.stdout.on('data', (data) => { result += data.toString(); });
+  child.stderr.on('data', (data) => { result += data.toString(); });
+
+  child.on('close', (code) => {
+    (async () => {
+    console.log(`[Relay] Correction result (exit ${code}): ${result.substring(0, 200)}`);
+
+    // Send acknowledgment back to WeChat via iLink
+    const botMapping = botStMap.get(botId);
+    if (botMapping) {
+      const success = result.includes('✅ 更正完成') || result.includes('🗑️');
+      const dryRun = result.includes('DRY RUN');
+      const reply = success
+        ? `已查证聊天记录并更正记忆 ✓`
+        : dryRun
+          ? null
+          : `已查证，但未找到需要更正的内容`;
+
+      if (reply) {
+        try {
+          await sendViaILink(botMapping, {
+            type: 'reply',
+            bot_id: botId,
+            user_id: wechatId,
+            content: reply,
+            action: 'send_message',
+          });
+        } catch (e) {
+          console.error('[Relay] Failed to send correction ack:', e.message);
+        }
+      }
+    }
+    })();
+  });
+
+  child.on('error', (err) => {
+    console.error(`[Relay] Correction spawn error:`, err.message);
+  });
+}
+
 async function pollMessages() {
   if (!hermesDb) {
     console.error('[Relay] Hermes DB not initialized');
@@ -372,6 +435,12 @@ async function pollMessages() {
       }
 
       for (const botId of targetBotIds) {
+        // Check for memory correction intent before forwarding to ST
+        const correctionPattern = /(?:这段|那个|这个|那里|这里).*(?:不对|不是|错了|记错)|(?:其实|应该是).+|^不对|^错了|^记错|纠正|更正|改一下/;
+        if (correctionPattern.test(content)) {
+          handleMemoryCorrection(content, wechatId, botId);
+        }
+
         // Route message to connected ST client (by wechat_id)
         const stClient = stClients.get(wechatId);
         if (stClient && stClient.ws.readyState === WebSocket.OPEN) {
