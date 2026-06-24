@@ -26,6 +26,9 @@ services:
       - uploads_data:/app/uploads
       - ./stickers:/app/stickers
       - ./st-data:/app/st-data
+      # ⚠️ 安全警告: Docker 套接字挂载使容器可控制宿主机 Docker
+      # 如果 api-server 被攻破，攻击者可创建任意容器
+      # 建议: 使用 Docker-in-Docker 或 Unix socket 代理替代
       - /var/run/docker.sock:/var/run/docker.sock
       # Docker CLI (bind-mount to avoid glibc/musl conflict)
       - /usr/bin/docker:/usr/local/bin/docker:ro
