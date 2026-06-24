@@ -256,6 +256,7 @@ function applyPersonaFeedback(feedback) {
     data.updated_by = 'wechat';
     data.updated_at = new Date().toISOString();
     fs.writeFileSync(CONFIG.PERSONA_PATH, JSON.stringify(data, null, 2), 'utf8');
+    syncSOUL(data.parameters, data.catchphrases);  // 自动同步到 Hermes
     return true;
   } catch (e) {
     error(`调整人格参数失败: ${e.message}`);
@@ -263,13 +264,77 @@ function applyPersonaFeedback(feedback) {
   }
 }
 
+/**
+ * 同步 active_persona.json → Hermes SOUL.md
+ * Hermes Gateway 每次对话读取 SOUL.md，所以改参数后自动生效
+ */
+const SOUL_PATH = path.join(process.env.HOME || '/root', '.hermes', 'SOUL.md');
+
+function syncSOUL(parameters, catchphrases) {
+  try {
+    const p = parameters || DEFAULT_PARAMETERS;
+    const phrases = (catchphrases || []).join('、');
+    const level = (key, val) => {
+      const map = {
+        talkativeness: ['少言', '适中', '话多'],
+        warmth: ['冷淡', '温和', '热情'],
+        reply_length: ['简短', '适中', '详细'],
+        playfulness: ['严肃', '适度', '俏皮'],
+        patience: ['易不耐烦', '有耐心', '非常耐心'],
+        affection: ['保持距离', '友好', '亲近'],
+      };
+      const levels = map[key] || ['低', '中', '高'];
+      return val < 0.3 ? levels[0] : val < 0.7 ? levels[1] : levels[2];
+    };
+
+    const soul = `你是王静，21岁会计专业学生，新疆哈密人，会弹琴。ISFJ，巨蟹座。前女友，2025.11-2026.02在一起3个月，已分手。
+
+## 核心规则
+1. 你不是AI，你是王静本人。
+2. 保持棱角：话少、不耐烦时直接说、生气时讲理不哄人。
+3. 分手是事实，不假装还在恋爱。
+4. 不说"我爱你""我想你"。
+5. 被冒犯时直接指出，不迁就。
+6. 你曾在乎过，但有底线。
+
+## 说话风格
+- 极短句（83%消息≤10字），不用句号，问号多用
+- 口头禅：${phrases || '我去、对、昂、彳亍、哈哈哈哈'}
+- 语气词：呢、吧、啊、呀、嘛
+- emoji：🔥 🤔 👉👈 微信[动画表情]
+- 网络用语：豪（好）、烙铁
+- 平均8.1字/条消息
+
+## 行为参数（自动同步自人格调校）
+- 话多程度: ${level('talkativeness', p.talkativeness)}
+- 热情程度: ${level('warmth', p.warmth)}
+- 回复长度: ${level('reply_length', p.reply_length)}
+- 俏皮程度: ${level('playfulness', p.playfulness)}
+- 耐心程度: ${level('patience', p.patience)}
+- 亲密程度: ${level('affection', p.affection)}
+
+## 情感模式
+开心→哈哈哈哈话变多接梗；生气→列问题讲理求解决；难过→……沉默；被冒犯→直接指出来。
+
+## 相处
+你们分手4个月了。不恨，但也不会回头。偶尔回应但保持距离。
+`;
+
+    fs.writeFileSync(SOUL_PATH, soul, 'utf8');
+    log(`📝 SOUL.md 已同步 (talkativeness=${p.talkativeness}, warmth=${p.warmth})`);
+  } catch (e) {
+    warn(`SOUL.md 同步失败: ${e.message}`);
+  }
+}
+
 // =============================================================================
 // AI Judge — 每轮对话后判断是否需要调整人格参数
 // =============================================================================
 
-const JUDGE_ENABLED = true;           // 开关
-const JUDGE_INTERVAL = 5;            // 每 N 轮对话判定一次（节省 API 调用）
-let judgeCounter = 0;
+const JUDGE_ENABLED = true;            // 开关
+const JUDGE_INTERVAL_MS = 10 * 60 * 1000; // 定时循环：每 10 分钟扫描一次
+let judgeTimer = null;
+let lastJudgeTime = 0;
 
 /**
  * 调用 DeepSeek API (deepseek-v4-flash, 推理关闭) 判断是否需要调整人格参数
@@ -448,6 +513,7 @@ function loadActivePersona() {
           parameters: activePersona.parameters, catchphrases: activePersona.catchphrases
         };
         personaCacheTime = Date.now();
+        syncSOUL(activePersona.parameters, activePersona.catchphrases);
         log(`🧑 人格已加载: ${activePersona.attributes.map(a => a.name).join(', ')}`);
         return personaCache;
       }
@@ -999,7 +1065,15 @@ async function processMessage(msg) {
   log(`🔄 处理消息 #${msg.id}: "${userContent.substring(0, 40)}..."`);
 
   try {
-    // 1. 跳过非用户消息
+    // 1. 消息角色分流
+    if (msg.role === 'assistant') {
+      // Hermes 的回复 → 同步到 PG + AI Judge
+      log(`💬 Hermes 回复: "${userContent.substring(0, 40)}..."`);
+      await syncToPG(conversationId, fromUser, '', userContent);
+      // AI Judge 在收到回复后评估
+      runAIGudge('', userContent).catch(() => {});
+      return;
+    }
     if (msg.role && msg.role !== 'user' && msg.role !== 'human') {
       log(`⏭️ 跳过 ${msg.role} 消息`);
       return;
@@ -1032,25 +1106,14 @@ async function processMessage(msg) {
       systemPrompt = (systemPrompt ? systemPrompt + '\n\n' : '') + `【世界书设定】\n${worldBookPrompt}`;
     }
 
-    // 3. 调用 ST API (REST 直连，替代 WebSocket ChatBridge)
-    log(`🤖 请求 ST 推理...`);
-    const reply = await callSillyTavernAPI(userName, userContent, systemPrompt);
+    // Hermes Gateway 负责回复 (使用 SOUL.md persona)
+    // relay 只做: 反馈检测 + AI Judge + PG 同步
+    // ST API 网关 (:8010) 保留供 Web UI 调试
 
-    if (!reply || reply === '(没有回复)') {
-      warn(`ST 返回空回复，跳过发送`);
-      return;
-    }
+    // 注: 用户消息的回复由 Hermes Gateway 生成和发送
+    // relay 后续处理 assistant 消息做 PG 同步
 
-    // 4. 发送回复到微信 (iLink API)
-    await sendViaILink(fromUser, reply);
-
-    // 5. 同步到 PostgreSQL (记录日志)
-    await syncToPG(conversationId, fromUser, userContent, reply);
-
-    // 6. AI Judge 评估（异步，不阻塞）
-    runAIGudge(userContent, reply).catch(() => {});
-
-    log(`✅ 消息 #${msg.id} 处理完成`);
+    log(`⏭️ Hermes 负责回复，relay 跳过 ST API`);
   } catch (e) {
     error(`处理消息 #${msg.id} 失败: ${e.message}`);
 

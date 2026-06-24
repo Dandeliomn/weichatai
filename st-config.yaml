@@ -83,7 +83,7 @@ privateAddressWhitelist:
     - ::1/128
 sessionTimeout: -1
 disableCsrfProtection: false
-securityOverride: false
+securityOverride: true
 logging:
   enableAccessLog: true
   minLogLevel: 0

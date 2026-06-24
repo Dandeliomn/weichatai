@@ -45,6 +45,46 @@ function error(msg) {
 }
 
 /**
+ * 调用 iLink getupdates 刷新 session
+ */
+function refreshSession() {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ get_updates_buf: '' });
+    const isHTTPS = parsedBase.protocol === 'https:';
+    const transport = isHTTPS ? https : http;
+    const options = {
+      hostname: parsedBase.hostname,
+      port: parsedBase.port || (isHTTPS ? 443 : 80),
+      path: '/ilink/bot/getupdates',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'Authorization': `Bearer ${TOKEN}`,
+      },
+      timeout: 10000,
+    };
+    const req = transport.request(options, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          const result = JSON.parse(data);
+          log(`🔄 Session 刷新: ret=${result.ret}`);
+          resolve(result.get_updates_buf || '');
+        } catch (e) {
+          resolve('');
+        }
+      });
+    });
+    req.on('error', () => resolve(''));
+    req.on('timeout', () => { req.destroy(); resolve(''); });
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
  * 调用 iLink 云 API 发送消息
  */
 function callILinkAPI(to, text) {
@@ -88,7 +128,7 @@ function callILinkAPI(to, text) {
               log(`✅ 发送成功 → ${to}: "${text.substring(0, 30)}"`);
               resolve(result);
             } else {
-              warn(`iLink 返回错误: ret=${result.ret} errcode=${result.errcode}`);
+              warn(`iLink 返回错误: ret=${result.ret} errcode=${result.errcode} raw=${JSON.stringify(result).substring(0, 200)}`);
               resolve(null); // 降级
             }
           } catch (e) {
@@ -96,7 +136,7 @@ function callILinkAPI(to, text) {
             resolve(null);
           }
         } else {
-          warn(`iLink HTTP ${res.statusCode}`);
+          warn(`iLink HTTP ${res.statusCode}: ${data.substring(0, 200)}`);
           resolve(null);
         }
       });
@@ -141,6 +181,8 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
+        // 先刷新 session，再发送
+        await refreshSession();
         const result = await callILinkAPI(to, content);
 
         if (result) {
