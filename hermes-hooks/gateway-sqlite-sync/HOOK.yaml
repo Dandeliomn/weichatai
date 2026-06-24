@@ -1,0 +1,5 @@
+name: gateway-sqlite-sync
+description: Forward incoming gateway messages to conversations.db for hermes-st-relay polling
+events:
+  - agent:start
+  - agent:end
