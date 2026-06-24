@@ -2,9 +2,82 @@
 
 > 项目位置：`/home/dandelion/wechat-companion`
 > 部署方式：Docker Compose + Hermes Gateway
-> 最后更新：2026-06-16
+> 最后更新：2026-06-24
 
 ---
+
+---
+
+## 2026-06-24 — 安全审计 + 架构优化 (Option B)
+
+### 安全修复
+
+| 问题 | 严重程度 | 修复 |
+|------|----------|------|
+| `.env` 泄露真实凭据 (API Key/JWT/DB密码) | 🔴 极高 | 替换为模板占位符，清除所有敏感值 |
+| `hermes-st-relay.js` SQL 字符串拼接 | 🔴 高 | 改为参数化查询 `$1` |
+| `memory-correct.js` 全部 SQL 注入 | 🔴 高 | `execSync`+psql 改为 `pg Pool` 参数化查询 |
+| 安全中间件在 body parser 之前执行 | 🟡 中 | 交换顺序，先解析 body 再安全检查 |
+| Docker 套接字挂载无风险说明 | 🟡 中 | 添加中文安全警告注释 |
+
+### 架构优化 (Option B)
+
+#### 合并 systemd 服务
+
+| 之前 (3 服务) | 之后 (1 服务) |
+|---------------|---------------|
+| `hermes-st-relay` (消息路由) | **`hermes-st-relay`** (合并版) |
+| `hermes-sync` (对话同步) | ↳ 集成到 `pollMessages()` 循环 |
+| `hermes-st-worldbook` (世界书) | ↳ 集成到 `startWorldBookWatcher()` |
+
+- `relay.js` SQL 改为查询所有角色消息（不限 `role='user'`）
+- 助理消息跳过 ST 路由，仅写入 `conversation_logs`
+- 用户消息实时 upsert 到 `users` 表（为富协议铺路）
+
+#### 移除 MinIO
+
+- MinIO 服务、`minio_data` 卷、相关端口映射已从 `docker-compose.yml` 删除
+- 代码已有本地文件系统回退（`minio.ts` 第 33 行: "未配置，使用本地文件系统存储"）
+- 存储配额跟踪功能保留，走本地文件
+
+#### 硬编码修复
+
+- `memory-correct.js` 中 ST 容器名 `weclaw-st-24926e2e3aa4-im-bot` 改为 `process.env.ST_CONTAINER_NAME`
+
+#### 废弃脚本
+
+| 脚本 | 状态 |
+|------|------|
+| `scripts/sync-hermes-conversations.js` | 📝 [DEPRECATED] 已合并到 relay |
+| `scripts/st-worldbook-autolink.js` | 📝 [DEPRECATED] 已合并到 relay |
+
+### 影响
+
+| 指标 | 之前 | 之后 |
+|------|------|------|
+| Systemd 服务 | 4 | **2** (gateway + relay) |
+| Docker 容器 | 7 | **6** (MinIO 移除) |
+| 总服务数 | **11** | **8** |
+
+### 部署操作
+
+```bash
+# 1. 停止废弃服务
+systemctl --user stop hermes-sync hermes-st-worldbook
+systemctl --user disable hermes-sync hermes-st-worldbook
+
+# 2. 重启 relay（现在包含同步+世界书）
+systemctl --user restart hermes-st-relay
+
+# 3. 重建 Docker（移除 MinIO 容器）
+docker compose down && docker compose up -d
+```
+
+### ⚠️ 已知遗留问题
+
+- git 历史中仍包含旧 `.env` 凭据，建议运行 `git filter-repo --path .env --invert-paths`
+- `memory-correct.js` 保留 `docker exec` 回退，但主要路径走 pg Pool
+- 富协议（历史/情绪/记忆）待实现，relay 中的 PG 同步为此铺路
 
 ## 2026-06-16 — Hermes 集成 + ex-skill 对接
 
