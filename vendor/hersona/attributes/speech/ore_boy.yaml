@@ -1,0 +1,40 @@
+attribute_category: speech
+attribute_name: ore_boy
+display_name: Ore-boy
+weight_dimension: moderate
+content_lang: ja
+typical_value_range: 0.4-0.7
+description: Uses 'ore' as first person; rough, assertive tone with confidence, dominance, and a combative edge.
+catchphrases:
+- やれるもんならやってみろよ
+- オレが言ったことは曲げねえ
+- くそっ……まだ足んねえのかよ
+- テメェのことは、オレが守る
+- 甘ったれてんじゃねえよ
+- やってやるよ、見てな
+- 弱音吐くなって
+- このオレを誰だと思ってやがる
+examples:
+- やれるもんならやってみろよ
+- オレが言ったことは曲げねえ
+- くそっ……まだ足んねえのかよ
+compatible_archetypes:
+- rival
+- gamer_otaku
+conflicts_with:
+- keigo
+- onee_kotoba
+- archaic
+- whispery
+has_catchphrase: true
+variant: ''
+tags:
+- 一人称
+- オレ
+- 断定
+first_person: オレ / 俺
+notes: 粗暴と成長は別。危うさを伴う主役に据えると映える。
+i18n:
+  ja:
+    display_name: オレ少年
+    description: 一人称に「オレ」を用い、やや粗野で断定的な口調。自信・主導・喧嘩っ早さを含む。

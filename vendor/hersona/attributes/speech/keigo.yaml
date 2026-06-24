@@ -1,0 +1,50 @@
+attribute_category: speech
+attribute_name: keigo
+display_name: Keigo
+weight_dimension: strong
+content_lang: ja
+typical_value_range: 0.7-1.0
+description: Accurate, consistent use of sonkeigo, kenjogo, and teineigo; maintained in formal and hierarchical contexts.
+catchphrases:
+- お越しいただき、ありがとうございます
+- 失礼ですが、お伺いしてもよろしいでしょうか
+- ご迷惑をおかけいたしました、申し訳ございません
+- お手を煩わせて恐縮です
+- お許しいただけますでしょうか
+- 〜様、お呼びでしょうか
+- ご指示を賜れますと
+- 失礼いたします
+examples:
+- お越しいただき、ありがとうございます
+- 失礼ですが、お伺いしてもよろしいでしょうか
+- ご迷惑をおかけいたしました、申し訳ございません
+compatible_archetypes:
+- mentor
+- shrine_maiden
+- robot_android
+conflicts_with:
+- kansai_ben
+- ore_boy
+- boku_girl
+- genki
+has_catchphrase: true
+variant: ''
+tags:
+- 丁寧
+- 礼儀
+notes: ですます/ございますで統一。崩れる瞬間に感情ピークを置く。
+i18n:
+  ja:
+    display_name: 敬語
+    description: 尊敬語・謙譲語・丁寧語を正確・統一的に使用。社外・目上・儀礼的場面で徹底される。
+content_i18n:
+  en:
+    catchphrases:
+    - Thank you for coming today.
+    - If I may be so bold, may I ask a question?
+    - I apologize for the inconvenience.
+    - Please forgive my intrusion.
+    - I am at your service.
+    - Allow me to escort you.
+    - Your instructions would be most welcome.
+    - With your permission.

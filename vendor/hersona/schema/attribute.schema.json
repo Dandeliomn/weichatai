@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "hersona Attribute",
+  "description": "Metadata YAML schema for hersona attribute templates (shared across personality / speech / archetype / visual / hobby). Every YAML under attributes/ is validated against this schema.",
+  "type": "object",
+  "required": [
+    "attribute_category",
+    "attribute_name",
+    "weight_dimension",
+    "examples"
+  ],
+  "oneOf": [
+    {
+      "title": "BASE metadata (en) with optional i18n overrides",
+      "required": ["display_name", "description"]
+    },
+    {
+      "title": "Legacy suffix-pair metadata (pre-i18n)",
+      "required": ["display_name_ja", "display_name_en", "description_ja", "description_en"]
+    }
+  ],
+  "properties": {
+    "attribute_category": {
+      "type": "string",
+      "description": "Top-level attribute category. As of v1.0+ one of five: personality / speech / archetype / visual / hobby.",
+      "enum": ["personality", "speech", "archetype", "visual", "hobby"]
+    },
+    "attribute_name": {
+      "type": "string",
+      "description": "Unique attribute ID (snake_case, ASCII only, 1-50 chars). Also used as the file name.",
+      "minLength": 1,
+      "maxLength": 50,
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "display_name": {
+      "type": "string",
+      "description": "Display name in the BASE language (en). Localized overrides go under i18n.<lang>.display_name.",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "description": "Attribute description in the BASE language (en). Localized overrides go under i18n.<lang>.description.",
+      "minLength": 1
+    },
+    "i18n": {
+      "type": "object",
+      "description": "Localized metadata overrides keyed by language code (e.g. ja). Each value may override display_name / description for that language.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "display_name": { "type": "string", "minLength": 1 },
+          "description": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "display_name_ja": {
+      "type": "string",
+      "description": "[legacy] Japanese display name. Superseded by i18n.ja.display_name.",
+      "minLength": 1
+    },
+    "display_name_en": {
+      "type": "string",
+      "description": "[legacy] English display name. Superseded by display_name (BASE).",
+      "minLength": 1
+    },
+    "weight_dimension": {
+      "type": "string",
+      "description": "Intensity dimension of this attribute. none = qualitative trait only, mild = faint, moderate = medium, strong = clearly manifested.",
+      "enum": ["none", "mild", "moderate", "strong"]
+    },
+    "content_lang": {
+      "type": "string",
+      "description": "Language of the persona-content fields (sentence_endings / catchphrases / second_person / tone / examples / core_traits). Drives response-language directives and intensity measurement. Absent is treated as 'ja' for backward compatibility.",
+      "enum": ["ja", "en"]
+    },
+    "typical_value_range": {
+      "type": "string",
+      "description": "Typical value range when used with weighting (e.g. '0.0-0.3', '0.4-0.7', '0.8-1.0'). Optional.",
+      "pattern": "^[0-1]\\.[0-9]-[0-1]\\.[0-9]$"
+    },
+    "description_ja": {
+      "type": "string",
+      "description": "[legacy] Japanese description. Superseded by i18n.ja.description.",
+      "minLength": 1
+    },
+    "description_en": {
+      "type": "string",
+      "description": "[legacy] English description. Superseded by description (BASE).",
+      "minLength": 1
+    },
+    "examples": {
+      "type": "array",
+      "description": "Example lines or behavior samples (fully original; no proper nouns or specific works). At least one.",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "compatible_archetypes": {
+      "type": "array",
+      "description": "List of archetype attribute_names expected to pair well. Empty array allowed.",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+      }
+    },
+    "has_catchphrase": {
+      "type": "boolean",
+      "description": "Whether the attribute has catchphrases (if true, examples are expected to contain catchphrase candidates). Optional."
+    },
+    "variant": {
+      "type": "string",
+      "description": "Variant label of the same attribute_name (e.g. 'light' / 'dark' / 'modern' / 'classical'). Empty string allowed.",
+      "pattern": "^[a-z][a-z0-9_]*$|^$"
+    },
+    "tags": {
+      "type": "array",
+      "description": "Tags for cross-cutting search (array of strings, assumed unique). Empty array allowed.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "conflicts_with": {
+      "type": "array",
+      "description": "List of other attribute_names that are mutually exclusive / not to be combined. Empty array allowed.",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+      }
+    },
+    "core_traits": {
+      "type": "array",
+      "description": "Array of personality trait tags (personality only, ~3-7). Human-readable labels, same shape as core_traits in power.yaml.",
+      "minItems": 3,
+      "maxItems": 7,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "speech_style": {
+      "type": "string",
+      "description": "One-line prose describing how tone, first/second person, sentence endings, and catchphrases interlock (speech only). Same shape as speech_style in power.yaml.",
+      "minLength": 1
+    },
+    "second_person": {
+      "type": "string",
+      "description": "Set of second-person labels on one line separated by '/' (speech only, same shape as power.yaml). e.g. 'you (general, imposing) / buddy (familiar)'.",
+      "minLength": 1
+    },
+    "sentence_endings": {
+      "type": "array",
+      "description": "Array of sentence-ending patterns (ja speech only; English has none). Same shape as sentence_endings in power.yaml.",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "lexical_markers": {
+      "type": "array",
+      "description": "Characteristic words/phrases of the speech register (used for en speech instead of sentence_endings, e.g. 'gonna', \"y'all\", 'indeed'). Drives en intensity measurement.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "register": {
+      "type": "string",
+      "description": "Speech register (language-neutral). Used mainly by en speech attributes.",
+      "enum": ["formal", "neutral", "casual", "vulgar"]
+    },
+    "catchphrases": {
+      "type": "array",
+      "description": "Array of catchphrases (all categories, ~1-15). Each item is either a plain string (no trigger) or an object with 'phrase' and optional 'when' (trigger condition).",
+      "minItems": 1,
+      "maxItems": 15,
+      "items": {
+        "oneOf": [
+          {"type": "string", "minLength": 1},
+          {
+            "type": "object",
+            "required": ["phrase"],
+            "additionalProperties": false,
+            "properties": {
+              "phrase": {"type": "string", "minLength": 1},
+              "when":   {"type": "string", "minLength": 1}
+            }
+          }
+        ]
+      }
+    },
+    "tone": {
+      "type": "string",
+      "description": "One-line prose describing voice, tension, and range (all categories). Same shape as tone in power.yaml.",
+      "minLength": 1
+    },
+    "content_i18n": {
+      "type": "object",
+      "description": "Per-language persona content authored natively (catchphrases / tone / core_traits / examples). Keyed by lang code (e.g. 'en'); the BASE top-level fields are ja. Used by render_blend to keep injected catchphrases in the persona's content language.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "catchphrases": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 15,
+            "items": {
+              "oneOf": [
+                {"type": "string", "minLength": 1},
+                {
+                  "type": "object",
+                  "required": ["phrase"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "phrase": {"type": "string", "minLength": 1},
+                    "when":   {"type": "string", "minLength": 1}
+                  }
+                }
+              ]
+            }
+          },
+          "tone": {"type": "string", "minLength": 1},
+          "core_traits": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "examples": {
+            "type": "array",
+            "description": "Native usage examples in this language (same patterns as BASE examples; no proper nouns or specific works).",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1}
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "notes": {
+      "type": "string",
+      "description": "Supplementary / operational notes (optional)."
+    },
+    "first_person": {
+      "type": "string",
+      "description": "First-person pronoun(s) used by this attribute, separated by ' / ' (e.g. 'オレ / 俺', 'ボク', 'わし'). Mainly for speech attributes. Drives the third intensity-measurement axis alongside sentence_endings and catchphrases.",
+      "minLength": 1
+    },
+    "image_prompt_tags": {
+      "type": "array",
+      "description": "English tag strings for image-generation prompts (Stable Diffusion / Flux etc.). Intended for visual attributes; language-neutral so no i18n needed.",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "additionalProperties": false
+}
