@@ -82,7 +82,7 @@ privateAddressWhitelist:
     - 127.0.0.0/8
     - ::1/128
 sessionTimeout: -1
-disableCsrfProtection: false
+disableCsrfProtection: true
 securityOverride: true
 logging:
   enableAccessLog: true
@@ -174,5 +174,5 @@ gemini:
   enableSystemPromptCache: false
   image:
     personGeneration: allow_adult
-enableServerPlugins: false
+enableServerPlugins: true
 enableServerPluginsAutoUpdate: true

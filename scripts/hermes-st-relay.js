@@ -1065,15 +1065,7 @@ async function processMessage(msg) {
   log(`🔄 处理消息 #${msg.id}: "${userContent.substring(0, 40)}..."`);
 
   try {
-    // 1. 消息角色分流
-    if (msg.role === 'assistant') {
-      // Hermes 的回复 → 同步到 PG + AI Judge
-      log(`💬 Hermes 回复: "${userContent.substring(0, 40)}..."`);
-      await syncToPG(conversationId, fromUser, '', userContent);
-      // AI Judge 在收到回复后评估
-      runAIGudge('', userContent).catch(() => {});
-      return;
-    }
+    // 1. 跳过非用户消息
     if (msg.role && msg.role !== 'user' && msg.role !== 'human') {
       log(`⏭️ 跳过 ${msg.role} 消息`);
       return;
@@ -1106,14 +1098,25 @@ async function processMessage(msg) {
       systemPrompt = (systemPrompt ? systemPrompt + '\n\n' : '') + `【世界书设定】\n${worldBookPrompt}`;
     }
 
-    // Hermes Gateway 负责回复 (使用 SOUL.md persona)
-    // relay 只做: 反馈检测 + AI Judge + PG 同步
-    // ST API 网关 (:8010) 保留供 Web UI 调试
+    // 3. 调用 ST API (REST 直连 via relay-api plugin)
+    log(`🤖 请求 ST 推理...`);
+    const reply = await callSillyTavernAPI(userName, userContent, systemPrompt);
 
-    // 注: 用户消息的回复由 Hermes Gateway 生成和发送
-    // relay 后续处理 assistant 消息做 PG 同步
+    if (!reply || reply === '(没有回复)') {
+      warn(`ST 返回空回复，跳过发送`);
+      return;
+    }
 
-    log(`⏭️ Hermes 负责回复，relay 跳过 ST API`);
+    // 4. 发送回复到微信 (iLink API)
+    await sendViaILink(fromUser, reply);
+
+    // 5. 同步到 PostgreSQL (记录日志)
+    await syncToPG(conversationId, fromUser, userContent, reply);
+
+    // 6. AI Judge 评估（异步，不阻塞）
+    runAIGudge(userContent, reply).catch(() => {});
+
+    log(`✅ 消息 #${msg.id} 处理完成`);
   } catch (e) {
     error(`处理消息 #${msg.id} 失败: ${e.message}`);
 

@@ -1,5 +1,63 @@
 ﻿# 更新日志
 
+## v2.3 — 2026-06-24（晚间）
+
+### 🏗 架构切换：Hermes 角色引擎
+
+- **角色回复由 Hermes Gateway 直接负责**
+  - Hermes 读取 SOUL.md 作为 persona，处理消息 → 生成回复 → 通过 weixin 平台发送
+  - relay 不再调用 ST API 或 iLink，只做：日志同步 + 人格反馈检测 + AI Judge + SOUL.md 同步
+  - 原因：ST API 需要 cookie session，iLink 云 API 需要长轮询 session（被 Hermes 独占）
+
+### 🎭 角色打磨双通道 (Plan A+B)
+
+- **Plan A — 微信关键词反馈**
+  - 12 组关键词→参数映射（太热情/话太多/太长了等）
+  - 检测到反馈 → 调 active_persona.json → 自动同步 SOUL.md → 下条生效
+- **Plan B — 仪表盘人格面板**
+  - `/persona` 页面：6 Slider + 口头禅编辑器 + 实时预览
+  - GET/POST `/api/persona` 共享数据层
+  - 保存 → 30s 内 relay 同步 SOUL.md
+- **AI Judge Loop**
+  - 定时 10 分钟扫描对话质量，自动建议参数调整
+  - deepseek-v4-flash + reasoning_effort=low + temperature=0
+
+### 🔧 基础设施
+
+- **ST API Gateway** (`:8010`)：relay → DeepSeek 翻译层，保留供调试
+- **iLink Bridge** (`:18789`)：新增 getupdates session 刷新
+- **SillyTavern** (`:8000`)：保留为角色调校沙盒
+- **王静角色卡**：PNG tEXt chunk 格式，ST 直接导入
+- **SOUL.md 自动同步**：syncSOUL() 函数，persona 变更自动反映到 Hermes
+
+### 🐛 修复
+
+| # | 问题 | 修复 |
+|---|------|------|
+| 1 | ST API 403 | 改用 Hermes SOUL.md 直回 |
+| 2 | iLink errcode=-14 session timeout | 新增 refreshSession() |
+| 3 | ST 健康检查 curl 不可用 | 改为 Node.js http.get |
+| 4 | ST config mount :ro | 改为 :rw |
+| 5 | hermes-st-relay.js BOM 头 | sed 去掉 |
+| 6 | conversations.db 不存在 | hook 自动创建 |
+| 7 | 废弃 systemd 服务 | 禁用 hermes-sync + st-worldbook |
+| 8 | Dockerfile apk 包名 | build-base + python3 |
+| 9 | st-manager.ts 缺失 | 创建 stub |
+| 10 | 角色卡 PNG 格式 | tEXt chunk ccv3 嵌入 |
+
+### 📁 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `scripts/st-api-gateway.js` | relay→DeepSeek 翻译层 |
+| `scripts/ilink-bridge.js` | relay→iLink 翻译层 |
+| `src/routes/persona.ts` | 人格参数 API |
+| `src/routes/st-manager.ts` | ST 管理 stub |
+| `dashboard/src/pages/Persona.tsx` | 人格调校面板 |
+| `hermes-hooks/gateway-sqlite-sync/` | Gateway→DB 桥接 hook |
+| `exes/静静/王静.st-角色卡.json` | 王静 ST 角色卡 |
+| `exes/静静/王静.png` | 王静 PNG 角色卡 |
+
 ## v2.2 — 2026-06-24
 
 ### 🆕 新功能
