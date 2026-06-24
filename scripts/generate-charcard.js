@@ -3,14 +3,17 @@
  * generate-charcard.js — hersona 人格 → SillyTavern 角色卡自动生成
  * =============================================================================
  *
+ * 从 active_persona.json (由 set-persona.js 产出) 读取属性列表，
+ * 解析 hersona YAML，生成 ST 兼容的角色卡 PNG。
+ *
  * 用法:
  *   node scripts/generate-charcard.js                    # 从 active_persona.json 生成
  *   node scripts/generate-charcard.js --name "小雯"      # 指定角色名
  *   node scripts/generate-charcard.js --output ./data/   # 指定输出目录
- *   node scripts/generate-charcard.js --openai           # 用 DeepSeek 生成示例对话
  *
  * 输出: <角色名>.png (SillyTavern 标准角色卡，可导入 ST)
  *
+ * 依赖: js-yaml (npm install js-yaml)
  * =============================================================================
  */
 
@@ -19,13 +22,12 @@
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const crypto = require('crypto');
 
 // ---------------------------------------------------------------------------
-// 配置
+// 配置 (与 relay 共用 PERSONA_PATH / HERSONA_ATTR_DIR 命名一致)
 // ---------------------------------------------------------------------------
 
-const ACTIVE_PERSONA = process.env.ACTIVE_PERSONA_FILE
+const PERSONA_PATH = process.env.PERSONA_PATH
   || path.join(require('os').homedir(), '.hermes', 'active_persona.json');
 const ATTR_DIR = process.env.HERSONA_ATTR_DIR
   || path.join(__dirname, '..', 'vendor', 'hersona', 'attributes');
@@ -33,125 +35,87 @@ const ST_CHARS_DIR = process.env.ST_CHARS_DIR
   || path.join(__dirname, '..', 'st-data', '24926e2e3aa4-im-bot', 'data', 'default-user', 'characters');
 
 // ---------------------------------------------------------------------------
-// 1. 读取活跃人格
+// 1. 读取活跃人格 (与 set-persona.js 产出的 { attributes, updated_at } 兼容)
 // ---------------------------------------------------------------------------
 
 function loadActiveAttributes() {
-  if (!fs.existsSync(ACTIVE_PERSONA)) {
-    console.error(`❌ 未找到活跃人格: ${ACTIVE_PERSONA}`);
+  if (!fs.existsSync(PERSONA_PATH)) {
+    console.error(`❌ 未找到活跃人格: ${PERSONA_PATH}`);
     console.error('   请先运行: node scripts/set-persona.js personality/tsundere');
     process.exit(1);
   }
-  const data = JSON.parse(fs.readFileSync(ACTIVE_PERSONA, 'utf-8'));
-  return data.attributes || [];
+
+  try {
+    const raw = fs.readFileSync(PERSONA_PATH, 'utf-8');
+    const data = JSON.parse(raw);
+
+    // 兼容 `{ attributes: [...] }` (set-persona.js 格式)
+    if (Array.isArray(data.attributes)) return data.attributes;
+
+    // 降级: 兼容旧格式 `{ current, path }` 单文件
+    if (data.path || data.file) {
+      console.warn('⚠️ 检测到旧格式 active_persona.json (单文件)，将直接使用');
+      return [{ category: 'old', name: 'custom', file: data.path || data.file }];
+    }
+
+    return [];
+  } catch (e) {
+    console.error(`❌ 读取人格文件失败: ${e.message}`);
+    process.exit(1);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// 2. 读取属性 YAML
+// 2. 读取属性 YAML (使用 js-yaml)
 // ---------------------------------------------------------------------------
+
+let jsyaml;
+try {
+  jsyaml = require('js-yaml');
+} catch (e) {
+  console.error('❌ 缺少 js-yaml 依赖，运行: npm install js-yaml');
+  process.exit(1);
+}
+
+/**
+ * 安全路径：防止 ../ 穿越
+ */
+function safeAttrPath(category, attrName) {
+  const sanitized = path.basename(String(category) + '_' + String(attrName));
+  const [catPart, namePart] = sanitized.split('_', 2);
+  if (!catPart || !namePart) return null;
+  return path.join(ATTR_DIR, catPart, namePart + '.yaml');
+}
 
 function loadAttributeYAML(attr) {
-  const yamlPath = path.join(ATTR_DIR, attr.category, attr.name + '.yaml');
-  if (!fs.existsSync(yamlPath)) {
-    console.warn(`⚠️ 跳过不存在的属性: ${attr.category}/${attr.name}`);
+  // 兼容自定义单文件路径
+  if (attr.file) {
+    if (!fs.existsSync(attr.file)) {
+      console.warn(`⚠️ 文件不存在: ${attr.file}`);
+      return null;
+    }
+    try {
+      const raw = fs.readFileSync(attr.file, 'utf-8');
+      return jsyaml.load(raw) || {};
+    } catch (e) {
+      console.warn(`⚠️ 解析失败: ${attr.file} — ${e.message}`);
+      return null;
+    }
+  }
+
+  const yamlPath = safeAttrPath(attr.category, attr.name);
+  if (!yamlPath || !fs.existsSync(yamlPath)) {
+    console.warn(`⚠️ 跳过不存在的属性: ${attr.category || '?'}/${attr.name || '?'}`);
     return null;
   }
-  const raw = fs.readFileSync(yamlPath, 'utf-8');
-  return parseSimpleYAML(raw);
-}
 
-function parseSimpleYAML(raw) {
-  const data = {};
-  let currentKey = null;
-  let currentMode = null; // null | 'array' | 'multiline'
-  let multilineBuf = '';
-
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trimEnd();
-    const indent = line.length - line.trimStart().length;
-    const content = line.trim();
-
-    // 跳过空行和注释
-    if (content === '' || content.startsWith('#')) {
-      if (currentMode === 'multiline' && content === '') {
-        multilineBuf += '\n';
-      }
-      continue;
-    }
-
-    // 多行模式续行
-    if (currentMode === 'multiline') {
-      if (indent >= 2) {
-        multilineBuf += (multilineBuf ? '\n' : '') + content;
-        continue;
-      } else {
-        // 多行结束
-        data[currentKey] = multilineBuf;
-        currentMode = null;
-        multilineBuf = '';
-        // 继续处理当前行
-      }
-    }
-
-    // 顶层 key: |-, key: >, key: value
-    const topMatch = content.match(/^(\w[\w_]*):\s*(.*)/);
-    if (topMatch && indent === 0) {
-      currentKey = topMatch[1];
-      const val = topMatch[2].trim();
-
-      if (val === '|-' || val === '>') {
-        currentMode = 'multiline';
-        multilineBuf = '';
-        continue;
-      }
-
-      if (val === '' || val === '[]') {
-        data[currentKey] = [];
-        currentMode = 'array';
-        continue;
-      }
-
-      data[currentKey] = parseYamlValue(val);
-      currentMode = null;
-      continue;
-    }
-
-    // 数组元素: - value 或 - |-
-    const arrMatch = content.match(/^-\s+(.*)/);
-    if (arrMatch && currentMode === 'array') {
-      const arrVal = arrMatch[1].trim();
-      if (arrVal === '|-') {
-        currentMode = 'multiline';
-        multilineBuf = '';
-        // Start collecting multiline for array item
-        // We'll append to the array when multiline ends
-        continue;
-      }
-      if (!Array.isArray(data[currentKey])) data[currentKey] = [];
-      data[currentKey].push(parseYamlValue(arrVal));
-      continue;
-    }
-
-    // 缩进子键: key: value
-    const subMatch = content.match(/^\s{2,}(\w[\w_]*):\s*(.*)/);
-    if (subMatch && currentKey && currentMode !== 'multiline') {
-      const subKey = currentKey + '.' + subMatch[1];
-      data[subKey] = parseYamlValue(subMatch[2].trim());
-      continue;
-    }
+  try {
+    const raw = fs.readFileSync(yamlPath, 'utf-8');
+    return jsyaml.load(raw) || {};
+  } catch (e) {
+    console.warn(`⚠️ 解析失败: ${attr.category}/${attr.name} — ${e.message}`);
+    return null;
   }
-
-  // 清理末尾多行
-  if (currentMode === 'multiline' && multilineBuf) {
-    data[currentKey] = multilineBuf;
-  }
-
-  return data;
-}
-
-function parseYamlValue(val) {
-  if (!val) return '';
-  return val.replace(/^['"](.*)['"]$/, '$1');
 }
 
 // ---------------------------------------------------------------------------
@@ -159,21 +123,19 @@ function parseYamlValue(val) {
 // ---------------------------------------------------------------------------
 
 function buildCharacterCard(attrs, options) {
-  const name = options.name || deriveName(attrs);
+  const name = sanitizeName(options.name || deriveName(attrs));
   const yamls = attrs.map(loadAttributeYAML).filter(Boolean);
 
   // 收集描述
-  const descriptions = yamls.map(y => y.description).filter(Boolean);
+  const descriptions = yamls.map(y => y.description || '').filter(Boolean);
   const description = descriptions.join('\n\n');
 
   // 收集核心特质
   const allTraits = [];
-  const coreTraitsKeys = yamls.filter(y => y.core_traits);
-  for (const y of coreTraitsKeys) {
-    const traits = Array.isArray(y.core_traits)
-      ? y.core_traits
-      : y.core_traits.split('\n').map(s => s.trim()).filter(Boolean);
-    allTraits.push(...traits);
+  for (const y of yamls) {
+    if (Array.isArray(y.core_traits)) {
+      allTraits.push(...y.core_traits.map(String));
+    }
   }
 
   // 收集人格描述
@@ -181,7 +143,7 @@ function buildCharacterCard(attrs, options) {
     .map(y => {
       const cat = y.attribute_category || '';
       const disp = y.display_name || y.attribute_name || '';
-      const desc = y.description || '';
+      const desc = (y.description || '').replace(/\n/g, ' ');
       return `[${cat}] ${disp}: ${desc}`;
     })
     .join('\n');
@@ -190,16 +152,18 @@ function buildCharacterCard(attrs, options) {
   const catchphrases = [];
   for (const y of yamls) {
     if (Array.isArray(y.catchphrases)) {
-      catchphrases.push(...y.catchphrases);
+      catchphrases.push(...y.catchphrases.map(p =>
+        typeof p === 'string' ? p : (p.phrase || '')
+      ).filter(Boolean));
     }
   }
 
   // 收集语气
-  const tones = yamls.map(y => y.tone).filter(Boolean);
+  const tones = yamls.map(y => y.tone || '').filter(Boolean);
   const tone = tones.join('; ');
 
   // 首条消息
-  const firstMes = catchphrases.length > 0
+  const firstMsg = catchphrases.length > 0
     ? catchphrases[0]
     : `你好呀，我是${name}~`;
 
@@ -215,7 +179,9 @@ function buildCharacterCard(attrs, options) {
   // 标签
   const allTags = new Set();
   for (const y of yamls) {
-    if (Array.isArray(y.tags)) y.tags.forEach(t => allTags.add(t));
+    if (Array.isArray(y.tags)) {
+      y.tags.forEach(t => allTags.add(String(t)));
+    }
     if (y.attribute_category) allTags.add(y.attribute_category);
     if (y.attribute_name) allTags.add(y.attribute_name);
   }
@@ -228,13 +194,13 @@ function buildCharacterCard(attrs, options) {
     spec_version: '3.0',
     data: {
       name,
-      description,
-      personality,
+      description: description || `${name}是一个由hersona属性生成的AI角色。`,
+      personality: personality || `${name}具有独特的性格特征。`,
       scenario,
-      first_mes: firstMes,
+      first_mes: firstMsg,
       mes_example: exampleDialogue,
       system_prompt: systemPrompt,
-      creator_notes: `Generated by hersona charcard generator\nAttributes: ${attrs.map(a => `${a.category}/${a.name}`).join(', ')}`,
+      creator_notes: `Generated by hersona charcard generator\nAttributes: ${attrs.map(a => `${a.category || '?'}/${a.name || 'unknown'}`).join(', ')}`,
       character_version: '1.0.0',
       tags: Array.from(allTags),
       extensions: {},
@@ -242,8 +208,14 @@ function buildCharacterCard(attrs, options) {
   };
 }
 
+/**
+ * 清理名称 — 防止路径穿越
+ */
+function sanitizeName(raw) {
+  return String(raw || '').replace(/[\/\\:*?"<>|]/g, '_').trim() || '助手';
+}
+
 function deriveName(attrs) {
-  // 从属性名组合一个中文名
   const nameMap = {
     tsundere: '傲娇酱', deredere: '小甜心', kuudere: '冷面侠', yandere: '病娇妹',
     genki: '元气少女', dandere: '害羞鬼', himedere: '小公主', laid_back: '悠然君',
@@ -264,14 +236,13 @@ function extractExamples(yamls) {
   for (const y of yamls) {
     if (Array.isArray(y.examples)) {
       for (const ex of y.examples) {
-        lines.push(ex);
+        lines.push(String(ex));
       }
     }
   }
   if (lines.length === 0) {
     return `<START>\n{{user}}: 你好呀\n{{char}}: 你好~`;
   }
-  // 取前5条示例
   return '<START>\n' + lines.slice(0, 5).join('\n');
 }
 
@@ -279,13 +250,13 @@ function buildSystemPrompt(name, traits, tone, catchphrases) {
   const parts = [
     `你是 ${name}。`,
     '',
-    `【核心性格】`,
+    '【核心性格】',
     traits.length > 0 ? traits.map(t => `- ${t}`).join('\n') : '- 友善、温暖',
     '',
-    `【语气风格】`,
+    '【语气风格】',
     tone || '自然、流畅、有温度',
     '',
-    `【规则】`,
+    '【规则】',
     '- 始终以角色的第一人称回复，不要加说理解释或旁白。',
     '- 回复要简短自然，像真人聊天，不要长篇大论。',
     '- 用中文回复。',
@@ -303,25 +274,14 @@ function buildSystemPrompt(name, traits, tone, catchphrases) {
 // 4. PNG + JSON 嵌入式角色卡 (SillyTavern 标准格式)
 // ---------------------------------------------------------------------------
 
-/**
- * 生成最小 PNG (80x80 纯色头像) + 内嵌角色卡 JSON
- * 参考: https://github.com/SillyTavern/SillyTavern/blob/dev/public/scripts/chars/char-data.js
- *
- * ST 格式: 标准 PNG 文件 + JSON 直接追加在 IEND 之后
- */
 function createCharCardPNG(cardData) {
-  // 1) 生成纯色头像 PNG (根据标签选颜色)
   const avatarPixels = generateAvatarPNG(cardData.data.tags);
-
-  // 2) 将 JSON 附加到 PNG 末尾
   const jsonStr = JSON.stringify(cardData, null, 2);
   const jsonBuf = Buffer.from(jsonStr, 'utf-8');
-
   return Buffer.concat([avatarPixels, jsonBuf]);
 }
 
 function generateAvatarPNG(tags) {
-  // 根据属性选底色
   const colorMap = {
     tsundere: '#FF6B6B', yandere: '#8B0000', deredere: '#FFB6C1',
     kuudere: '#87CEEB', genki: '#FFD700', himedere: '#DDA0DD',
@@ -330,73 +290,56 @@ function generateAvatarPNG(tags) {
     childhood_friend: '#98FB98', rival: '#FF6347', idol: '#FF69B4',
   };
 
-  let bgColor = '#5B9BD5'; // default blue
-  for (const tag of tags) {
-    if (colorMap[tag]) { bgColor = colorMap[tag]; break; }
+  let bgColor = '#5B9BD5';
+  for (const tag of (Array.isArray(tags) ? tags : [])) {
+    if (colorMap[String(tag)]) { bgColor = colorMap[String(tag)]; break; }
   }
 
   const r = parseInt(bgColor.slice(1, 3), 16);
   const g = parseInt(bgColor.slice(3, 5), 16);
   const b = parseInt(bgColor.slice(5, 7), 16);
+  const width = 80, height = 80;
 
-  const width = 80;
-  const height = 80;
-
-  // 生成 PNG (最小实现，无外部依赖)
-  // PNG 结构: Signature | IHDR | IDAT | IEND
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
-  // IHDR
   const ihdrData = Buffer.alloc(13);
-  ihdrData.writeUInt32BE(width, 0);   // width
-  ihdrData.writeUInt32BE(height, 4);  // height
-  ihdrData[8] = 8;   // bit depth
-  ihdrData[9] = 2;   // color type (RGB)
-  ihdrData[10] = 0;  // compression
-  ihdrData[11] = 0;  // filter
-  ihdrData[12] = 0;  // interlace
+  ihdrData.writeUInt32BE(width, 0);
+  ihdrData.writeUInt32BE(height, 4);
+  ihdrData[8] = 8; ihdrData[9] = 2;
+  ihdrData[10] = 0; ihdrData[11] = 0; ihdrData[12] = 0;
   const ihdr = createChunk('IHDR', ihdrData);
 
-  // IDAT — 用 zlib 压缩像素数据
-  const rawScanlines = Buffer.alloc(height * (1 + width * 3)); // 1 filter byte + RGB
+  const rawScanlines = Buffer.alloc(height * (1 + width * 3));
   for (let y = 0; y < height; y++) {
     const offset = y * (1 + width * 3);
-    rawScanlines[offset] = 0; // filter: None
+    rawScanlines[offset] = 0;
     for (let x = 0; x < width; x++) {
       rawScanlines[offset + 1 + x * 3] = r;
       rawScanlines[offset + 2 + x * 3] = g;
       rawScanlines[offset + 3 + x * 3] = b;
     }
   }
-  const compressed = zlib.deflateSync(rawScanlines);
-  const idat = createChunk('IDAT', compressed);
-
-  // IEND
+  const idat = createChunk('IDAT', zlib.deflateSync(rawScanlines));
   const iend = createChunk('IEND', Buffer.alloc(0));
 
   return Buffer.concat([signature, ihdr, idat, iend]);
 }
 
 function createChunk(type, data) {
-  const length = Buffer.alloc(4);
-  length.writeUInt32BE(data.length, 0);
-
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
   const typeBuf = Buffer.from(type, 'ascii');
   const crc = crc32(Buffer.concat([typeBuf, data]));
-
   const crcBuf = Buffer.alloc(4);
   crcBuf.writeUInt32BE(crc, 0);
-
-  return Buffer.concat([length, typeBuf, data, crcBuf]);
+  return Buffer.concat([len, typeBuf, data, crcBuf]);
 }
 
 function crc32(buf) {
   let crc = 0xFFFFFFFF;
   for (let i = 0; i < buf.length; i++) {
     crc ^= buf[i];
-    for (let j = 0; j < 8; j++) {
-      crc = (crc >>> 1) ^ (crc & 1 ? 0xEDB88320 : 0);
-    }
+    for (let j = 0; j < 8; j++) crc = (crc >>> 1) ^ (crc & 1 ? 0xEDB88320 : 0);
   }
   return (crc ^ 0xFFFFFFFF) >>> 0;
 }
@@ -407,15 +350,13 @@ function crc32(buf) {
 
 function main() {
   const args = process.argv.slice(2);
-  const options = { name: null, output: null, openai: false };
+  const options = { name: null, output: null };
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--name' && args[i + 1]) {
       options.name = args[++i];
     } else if (args[i] === '--output' && args[i + 1]) {
       options.output = args[++i];
-    } else if (args[i] === '--openai') {
-      options.openai = true;
     } else if (args[i] === '--help') {
       console.log(`
 用法:
@@ -424,13 +365,11 @@ function main() {
 选项:
   --name <名字>     角色名称 (默认从属性自动推导)
   --output <目录>   输出目录 (默认: st-data 角色目录)
-  --openai          使用 DeepSeek 生成更丰富的示例对话
   --help            显示此帮助
 
 示例:
   node scripts/generate-charcard.js
   node scripts/generate-charcard.js --name "小雯"
-  node scripts/generate-charcard.js --output /tmp/ --name "测试角色"
 `);
       return;
     }
@@ -441,17 +380,17 @@ function main() {
   const attrs = loadActiveAttributes();
 
   if (attrs.length === 0) {
-    console.error('❌ 没有活跃属性和。请先设置人格: node scripts/set-persona.js personality/tsundere');
+    console.error('❌ 没有活跃属性。请先设置人格: node scripts/set-persona.js personality/tsundere');
     process.exit(1);
   }
 
-  console.log(`  已选择属性: ${attrs.map(a => `${a.category}/${a.name}`).join(', ')}`);
+  console.log(`  已选择属性: ${attrs.map(a => `${a.category || '?'}/${a.name || 'unknown'}`).join(', ')}`);
 
   // 2. 构建角色卡
   console.log('🔧 生成角色卡...');
   const card = buildCharacterCard(attrs, options);
   console.log(`  角色名: ${card.data.name}`);
-  console.log(`  标签: ${card.data.tags.join(', ')}`);
+  console.log(`  标签: ${Array.isArray(card.data.tags) ? card.data.tags.join(', ') : '无'}`);
 
   // 3. 生成 PNG
   console.log('🖼️ 生成头像...');
@@ -459,13 +398,22 @@ function main() {
 
   // 4. 保存
   const outDir = options.output || ST_CHARS_DIR;
-  if (!fs.existsSync(outDir)) {
-    fs.mkdirSync(outDir, { recursive: true });
+  try {
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+  } catch (e) {
+    console.error(`❌ 无法创建输出目录: ${outDir} — ${e.message}`);
+    process.exit(1);
   }
 
-  const fileName = `${card.data.name}.png`;
+  const fileName = sanitizeName(card.data.name) + '.png';
   const filePath = path.join(outDir, fileName);
-  fs.writeFileSync(filePath, png);
+  try {
+    fs.writeFileSync(filePath, png);
+  } catch (e) {
+    console.error(`❌ 无法写入文件: ${filePath} — ${e.message}`);
+    process.exit(1);
+  }
+
   console.log(`\n✅ 角色卡已生成: ${filePath}`);
   console.log(`  大小: ${(png.length / 1024).toFixed(1)}KB`);
   console.log(`\n💡 下一步: 在 SillyTavern UI 中点击 "+" 导入此角色卡`);

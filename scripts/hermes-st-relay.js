@@ -191,10 +191,10 @@ let personaCache = null;
 let personaCacheTime = 0;
 
 /**
- * 加载当前激活的人格
- * 1. 读取 active_persona.json → 获取 YAML 路径
- * 2. 解析 hersona YAML → 提取人格属性
- * 3. 缓存 30s (PERSONA_CACHE_TTL)
+ * 加载当前激活的人格 (兼容 set-persona.js 的 attributes 数组格式)
+ * 1. 读取 active_persona.json → 获取属性列表
+ * 2. 逐个解析 hersona YAML → 提取人格属性
+ * 3. 组合为 system prompt，缓存 30s
  *
  * @returns {{ name: string, systemPrompt: string, traits: object } | null}
  */
@@ -205,57 +205,109 @@ function loadActivePersona() {
   }
 
   try {
-    // 1. 读取 active_persona.json
     if (!fs.existsSync(CONFIG.PERSONA_PATH)) {
-      log('ℹ️ 无人格配置 (active_persona.json 不存在)');
       personaCache = null;
       return null;
     }
 
     const activePersona = JSON.parse(fs.readFileSync(CONFIG.PERSONA_PATH, 'utf8'));
+    const HERSONA_ATTR_DIR = process.env.HERSONA_ATTR_DIR
+      || path.join(__dirname, '..', 'vendor', 'hersona', 'attributes');
+
+    // ---- 新格式: { attributes: [{category, name}, ...] } (set-persona.js) ----
+    if (Array.isArray(activePersona.attributes) && activePersona.attributes.length > 0) {
+      const allYamls = [];
+      let personaName = '';
+
+      for (const attr of activePersona.attributes) {
+        const yamlPath = path.join(HERSONA_ATTR_DIR, attr.category, attr.name + '.yaml');
+        if (!fs.existsSync(yamlPath)) continue;
+        try {
+          const jsyaml = require('js-yaml');
+          const ydata = jsyaml.load(fs.readFileSync(yamlPath, 'utf8')) || {};
+          allYamls.push(ydata);
+          if (!personaName && ydata.display_name) personaName = ydata.display_name;
+        } catch (e) {
+          warn(`解析属性失败 ${attr.category}/${attr.name}: ${e.message}`);
+        }
+      }
+
+      if (allYamls.length > 0) {
+        const systemPrompt = buildCombinedPersonaPrompt(personaName || '助手', allYamls);
+        personaCache = { name: personaName || '助手', systemPrompt, traits: allYamls, raw: allYamls };
+        personaCacheTime = Date.now();
+        log(`🧑 人格已加载: ${activePersona.attributes.map(a => a.name).join(', ')}`);
+        return personaCache;
+      }
+    }
+
+    // ---- 旧格式降级: { current/name, path/file } ----
     const personaName = activePersona.current || activePersona.name;
     const personaFile = activePersona.path || activePersona.file;
-
-    if (!personaFile) {
-      warn('active_persona.json 缺少 path/file 字段');
-      return null;
-    }
-
-    // 2. 解析 hersona YAML
-    let personaData = null;
-    const yamlPath = path.resolve(personaFile);
-
-    if (fs.existsSync(yamlPath)) {
+    if (personaFile && fs.existsSync(personaFile)) {
+      let personaData = null;
       try {
         const jsyaml = require('js-yaml');
-        personaData = jsyaml.load(fs.readFileSync(yamlPath, 'utf8'));
+        personaData = jsyaml.load(fs.readFileSync(personaFile, 'utf8')) || {};
       } catch (e) {
-        warn(`解析 hersona YAML 失败: ${e.message}`);
-        // 尝试将文件作为纯文本读入
-        personaData = { raw: fs.readFileSync(yamlPath, 'utf8') };
+        personaData = { raw: fs.readFileSync(personaFile, 'utf8') };
       }
-    } else {
-      warn(`人格文件不存在: ${yamlPath}`);
-      return null;
+      const systemPrompt = buildPersonaSystemPrompt(personaName, personaData);
+      personaCache = { name: personaName || '助手', systemPrompt, traits: personaData?.traits || {}, raw: personaData };
+      personaCacheTime = Date.now();
+      log(`🧑 人格已加载 (旧格式): ${personaName}`);
+      return personaCache;
     }
 
-    // 3. 构建 system prompt
-    const systemPrompt = buildPersonaSystemPrompt(personaName, personaData);
-
-    personaCache = {
-      name: personaName || '助手',
-      systemPrompt,
-      traits: personaData?.traits || personaData?.attributes || {},
-      raw: personaData,
-    };
-    personaCacheTime = Date.now();
-
-    log(`🧑 人格已加载: ${personaName}`);
-    return personaCache;
+    personaCache = null;
+    return null;
   } catch (e) {
     error(`加载人格失败: ${e.message}`);
     return null;
   }
+}
+
+/**
+ * 从多个 hersona YAML 构建组合 system prompt (新格式)
+ */
+function buildCombinedPersonaPrompt(name, yamls) {
+  const parts = [`你是 ${name}。`];
+
+  // 收集所有核心特质
+  const allTraits = [];
+  for (const y of yamls) {
+    if (Array.isArray(y.core_traits)) allTraits.push(...y.core_traits.map(String));
+  }
+  if (allTraits.length > 0) {
+    parts.push(`\n【核心性格】\n${allTraits.map(t => `- ${t}`).join('\n')}`);
+  }
+
+  // 收集语气
+  const tones = yamls.map(y => y.tone || '').filter(Boolean);
+  if (tones.length > 0) {
+    parts.push(`\n【语气风格】\n${tones.join('; ')}`);
+  }
+
+  // 收集口头禅
+  const allPhrases = [];
+  for (const y of yamls) {
+    if (Array.isArray(y.catchphrases)) {
+      for (const p of y.catchphrases) {
+        allPhrases.push(typeof p === 'string' ? p : (p.phrase || ''));
+      }
+    }
+  }
+  if (allPhrases.length > 0) {
+    parts.push(`\n【常用口头禅】\n${allPhrases.filter(Boolean).slice(0, 6).map(p => `- ${p}`).join('\n')}`);
+  }
+
+  // 收集描述
+  const descs = yamls.map(y => y.description || '').filter(Boolean);
+  if (descs.length > 0) {
+    parts.push(`\n【属性说明】\n${descs.join('\n')}`);
+  }
+
+  return parts.join('\n');
 }
 
 /**
@@ -814,7 +866,7 @@ async function mainLoop() {
       // 定期检查 SQLite 连接健康
       if (pollCount % 50 === 0 && db) {
         try {
-          if (database && database.prepare) {
+          if (db && db.prepare) {
             db.prepare('SELECT 1').get();
           }
         } catch (e) {
