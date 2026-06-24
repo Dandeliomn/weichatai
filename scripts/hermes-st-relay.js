@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 /**
  * hermes-st-relay.js — SillyTavern 直连消息中继（合并版）
  * =============================================================================
@@ -51,7 +51,7 @@ const CONFIG = {
   ILINK_API_TOKEN: process.env.ILINK_API_TOKEN || '',
 
   // PostgreSQL (同步日志)
-  PG_URL: process.env.DATABASE_URL || 'postgresql://weclaw:weclaw_secret@postgres:5432/weclaw_companion',
+  PG_URL: process.env.DATABASE_URL || null,  // 未设置时禁用 PG 同步
 
   // 人格注入 (Rich Protocol)
   PERSONA_PATH: process.env.PERSONA_PATH || path.join(process.env.HOME || '/root', '.hermes', 'active_persona.json'),
@@ -146,7 +146,7 @@ function pollMessages(lastCursor) {
 
   try {
     let rows;
-    if (db && db.prepare) {
+    if (database && database.prepare) {
       // better-sqlite3
       const stmt = database.prepare(`
         SELECT id, conversation_id, role, content, created_at
@@ -391,79 +391,61 @@ function callSillyTavernAPI(userName, message, systemPrompt) {
       let buffer = '';
       let lastEvent = '';
 
+      const bufferLines = [];  // 按行收集 SSE 事件（延后解析，避免尾帧丢 data: 前缀）
+
+      res.on('error', (e) => {
+        reject(new Error(`ST API 响应流中断: ${e.message}`));
+      });
+
       res.on('data', (chunk) => {
         buffer += chunk.toString();
-
-        // 按行处理 SSE
         const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // 保留不完整的最后一行
+        buffer = lines.pop() || '';  // 保留不完整的最后一行
 
         for (const line of lines) {
+          bufferLines.push(line);
+        }
+      });
+
+      res.on('end', () => {
+        // 将 buffer 中剩余部分也推入
+        if (buffer.trim()) bufferLines.push(buffer.trim());
+
+        // 统一解析所有行（保证 data:/event: 前缀被正确处理）
+        for (const line of bufferLines) {
           const trimmed = line.trim();
+          if (trimmed === '' || trimmed.startsWith(':')) continue;
 
-          // 跳过空行（SSE 事件分隔符）
-          if (trimmed === '') continue;
-
-          // 事件类型行
           if (trimmed.startsWith('event:')) {
             lastEvent = trimmed.slice(6).trim();
             continue;
           }
 
-          // 数据行
           if (trimmed.startsWith('data:')) {
             const dataStr = trimmed.slice(5).trim();
-
             try {
               const data = JSON.parse(dataStr);
-
               if (data.event === 'token' || data.event === 'text') {
-                // Token 流 — 逐步拼接回复
                 fullResponse += data.value || data.text || '';
               } else if (data.event === 'final' || data.event === 'done') {
-                // 最终消息体
-                if (data.mes?.content) {
-                  fullResponse = data.mes.content;
-                } else if (data.content) {
-                  fullResponse = data.content;
-                }
-              } else if (data.event === 'stream_end') {
-                // 流正常结束
+                if (data.mes?.content) fullResponse = data.mes.content;
+                else if (data.content) fullResponse = data.content;
               } else if (data.event === 'error') {
                 error(`ST API 流错误: ${data.message || data.value}`);
               } else if (data.value) {
-                // 无 event 字段，但有 value — 视为 token
                 fullResponse += data.value;
               }
             } catch (_) {
-              // 非 JSON 数据行，尝试作为纯文本 token
-              if (dataStr && lastEvent === 'token') {
-                fullResponse += dataStr;
-              }
+              if (dataStr && lastEvent === 'token') fullResponse += dataStr;
             }
             continue;
           }
 
           // 无 event/data 前缀的行 — 尝试 JSON 解析
-          if (trimmed && !trimmed.startsWith(':')) {
-            try {
-              const data = JSON.parse(trimmed);
-              if (data.value) fullResponse += data.value;
-              else if (data.text) fullResponse += data.text;
-              else if (data.content) fullResponse = data.content;
-            } catch (_) {
-              // 忽略无法解析的行
-            }
-          }
-        }
-      });
-
-      res.on('end', () => {
-        // 处理 buffer 中剩余的内容
-        if (buffer.trim()) {
           try {
-            const data = JSON.parse(buffer.trim());
+            const data = JSON.parse(trimmed);
             if (data.value) fullResponse += data.value;
+            else if (data.text) fullResponse += data.text;
             else if (data.content) fullResponse = data.content;
           } catch (_) { /* 忽略 */ }
         }
@@ -526,6 +508,10 @@ function sendViaILink(toUser, replyText) {
 
     const req = http.request(options, (res) => {
       let data = '';
+      res.on('error', (e) => {
+        warn(`iLink 响应流错误: ${e.message}`);
+        resolve(null); // 降级：不阻塞
+      });
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
         if (res.statusCode === 200) {
@@ -553,9 +539,14 @@ function sendViaILink(toUser, replyText) {
 // =============================================================================
 
 let pgPool = null;
+let pgRetryTimer = null;
 
 async function getPG() {
   if (pgPool) return pgPool;
+  if (!CONFIG.PG_URL) {
+    // 未配置 DATABASE_URL，静默禁用同步
+    return null;
+  }
   try {
     const { Pool } = require('pg');
     pgPool = new Pool({
@@ -568,15 +559,18 @@ async function getPG() {
     log('🐘 PostgreSQL 已连接');
     return pgPool;
   } catch (e) {
-    warn(`PostgreSQL 连接失败 (降级运行): ${e.message}`);
+    warn(`PostgreSQL 连接失败 (将在下次同步时重试): ${e.message}`);
     return null;
   }
 }
 
 /**
  * 同步消息到 PostgreSQL conversation_logs
+ * 首次失败后会每次尝试重连，成功即恢复。
  */
 async function syncToPG(conversationId, fromUser, userMsg, botReply) {
+  if (!CONFIG.PG_URL) return;  // 未配置，静默跳过
+
   try {
     const pool = await getPG();
     if (!pool) return;
@@ -593,7 +587,14 @@ async function syncToPG(conversationId, fromUser, userMsg, botReply) {
       [conversationId, fromUser, botReply]
     );
   } catch (e) {
-    warn(`PG 同步失败: ${e.message}`);
+    // pgPool 可能已失效，清除缓存强制下次重试
+    if (e.message?.includes('Connection') || e.message?.includes('terminated')) {
+      warn(`PG 连接失效，准备重建: ${e.message}`);
+      try { pgPool?.end(); } catch (_) {}
+      pgPool = null;
+    } else {
+      warn(`PG 同步失败: ${e.message}`);
+    }
   }
 }
 
@@ -627,6 +628,11 @@ function startWorldBookWatcher() {
         loadWorldBooks();
       }
     });
+    worldBookWatcher.on('error', (e) => {
+      warn(`世界书监控错误: ${e.message} (停止监控)`);
+      try { worldBookWatcher.close(); } catch (_) {}
+      worldBookWatcher = null;
+    });
   } catch (e) {
     warn(`世界书监控启动失败: ${e.message}`);
   }
@@ -653,6 +659,32 @@ function loadWorldBooks() {
   }
 }
 
+/**
+ * 从世界书中查找与用户消息匹配的词条
+ * 简单关键词匹配：词条 key 出现在消息中即视为匹配
+ */
+function getWorldBookMatches(userMessage) {
+  const matches = [];
+  if (!userMessage || Object.keys(worldBookCache).length === 0) return matches;
+
+  for (const [filename, book] of Object.entries(worldBookCache)) {
+    const entries = Array.isArray(book) ? book : (book.entries || []);
+    for (const entry of entries) {
+      const keys = Array.isArray(entry.keys) ? entry.keys : [entry.key];
+      for (const key of keys) {
+        if (key && userMessage.includes(key)) {
+          matches.push({
+            key: key,
+            content: entry.content || entry.description || JSON.stringify(entry),
+          });
+          break;  // 每个词条只匹配一次
+        }
+      }
+    }
+  }
+  return matches;
+}
+
 // =============================================================================
 // 7. 消息处理主循环
 // =============================================================================
@@ -675,9 +707,18 @@ async function processMessage(msg) {
       return;
     }
 
-    // 2. 加载人格 (富协议)
+    // 2. 加载人格 (富协议) + 世界书
     const persona = loadActivePersona();
-    const systemPrompt = persona ? persona.systemPrompt : '';
+    let systemPrompt = persona ? persona.systemPrompt : '';
+
+    // 注入世界书 (匹配当前用户消息中出现的词条)
+    const worldBookEntries = getWorldBookMatches(userContent);
+    if (worldBookEntries.length > 0) {
+      const worldBookPrompt = worldBookEntries
+        .map(e => `[${e.key}] ${e.content}`)
+        .join('\n');
+      systemPrompt = (systemPrompt ? systemPrompt + '\n\n' : '') + `【世界书设定】\n${worldBookPrompt}`;
+    }
 
     // 3. 调用 ST API (REST 直连，替代 WebSocket ChatBridge)
     log(`🤖 请求 ST 推理...`);
@@ -773,7 +814,7 @@ async function mainLoop() {
       // 定期检查 SQLite 连接健康
       if (pollCount % 50 === 0 && db) {
         try {
-          if (db && db.prepare) {
+          if (database && database.prepare) {
             db.prepare('SELECT 1').get();
           }
         } catch (e) {
