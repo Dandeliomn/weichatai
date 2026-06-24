@@ -3,6 +3,15 @@
  * sync-hermes-conversations.js
  * 从宿主机 Hermes state.db 同步微信对话到 Docker PostgreSQL
  * 用法: node scripts/sync-hermes-conversations.js [--once]
+ *
+ * [DEPRECATED] — 此功能已合并到 scripts/hermes-st-relay.js 的 pollMessages() 中。
+ * relay 在读取消息时同时写入 conversation_logs，不再需要独立同步进程。
+ * systemd 服务 hermes-sync.service 可以停用。
+ */
+
+ * sync-hermes-conversations.js
+ * 从宿主机 Hermes state.db 同步微信对话到 Docker PostgreSQL
+ * 用法: node scripts/sync-hermes-conversations.js [--once]
  */
 
 const { Pool } = require('pg');
