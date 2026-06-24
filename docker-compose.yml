@@ -44,7 +44,8 @@ services:
       - "8000:8000"
     volumes:
       - st_data:/home/node/app/data
-      - ./st-config.yaml:/home/node/app/config.yaml:ro
+      # ST 启动时会自动补全缺失的配置项写入此文件，必须 rw
+      - ./st-config.yaml:/home/node/app/config.yaml
     environment:
       - SILLYTAVERN_PORT=8000
       - SILLYTAVERN_PROTOCOL=http
@@ -52,7 +53,7 @@ services:
     networks:
       - companion-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8000',r=>{process.exit(0)}).on('error',()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
