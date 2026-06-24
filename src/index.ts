@@ -29,6 +29,7 @@ import importRouter, { initImportRoutes } from './routes/import';
 import characterRouter, { initCharacterRoutes } from './routes/characters';
 import bridgeRouter, { initBridgeRoutes } from './routes/bridge';
 import stManager from './routes/st-manager';
+import initCorrectionRoutes from './routes/correction';
 
 // =============================================================================
 // 配置常量
@@ -144,12 +145,12 @@ export const authLimiter = rateLimit({
   skipSuccessfulRequests: false,
 });
 
-// 5. 统一安全中间件 (XSS消毒 + SQL检测 + 输入验证 + 日志)
-app.use(securityGuard);
-
-// 9. Body 解析 (增大限制以支持文件上传)
+// 5. Body 解析 (增大限制以支持文件上传)
 app.use(express.json({ limit: '500mb' }));
 app.use(express.urlencoded({ extended: true, limit: '500mb' }));
+
+// 6. 统一安全中间件 (XSS消毒 + SQL检测 + 输入验证 + 日志)
+app.use(securityGuard);
 
 // 静态文件 - 上传目录
 app.use('/uploads', express.static('uploads'));
@@ -569,7 +570,6 @@ app.use('/api/import', importRouter);
 app.use('/api/characters', characterRouter);
 app.use('/api', bridgeRouter);
 app.use('/api/st', stManager);
-import initCorrectionRoutes from './routes/correction';
 app.use('/api/memory', initCorrectionRoutes(pgPool));
 
 // =============================================================================
