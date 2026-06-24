@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # 微信情感陪伴AI服务 - Docker Compose 编排文件
 # 一键部署: docker compose up -d
 # =============================================================================
@@ -6,6 +6,58 @@
 name: wechat-companion
 
 services:
+  # ===========================================================================
+  # WeClaw 微信桥接层 - 处理微信扫码登录、消息收发
+  # 基于 WeClawBot-API (https://github.com/Cp0204/WeClawBot-API)
+  # 使用 expect(unbuffer) 提供伪终端以捕获 incoming 消息
+  # ===========================================================================
+  weclaw-bridge:
+    build:
+      context: .
+      dockerfile: weclaw-bridge.Dockerfile
+    container_name: weclaw-bridge
+    ports:
+      - "26322:26322"
+    volumes:
+      - weclaw_config:/app/config
+      - ./bridge-forward.sh:/bridge-forward.sh:ro
+    restart: unless-stopped
+    networks:
+      - companion-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:26322/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ===========================================================================
+  # SillyTavern - 角色引擎 (REST API 直连，替代 ChatBridge WebSocket)
+  # relay (hermes-st-relay.js) 通过 HTTP REST 直接调用 ST API，
+  # 无需浏览器/WebSocket/伪终端环境
+  # 首次配置: 在 ST Web UI (http://localhost:8000) 设置 API Key 和角色卡
+  # ===========================================================================
+  sillytavern:
+    image: ghcr.io/sillytavern/sillytavern:latest
+    container_name: sillytavern
+    ports:
+      - "8000:8000"
+    volumes:
+      - st_data:/home/node/app/data
+      - ./st-config.yaml:/home/node/app/config.yaml:ro
+    environment:
+      - SILLYTAVERN_PORT=8000
+      - SILLYTAVERN_PROTOCOL=http
+    restart: unless-stopped
+    networks:
+      - companion-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
   # ===========================================================================
   # 主应用 - Express API 服务器
   # 接收WeClaw转发消息，将任务入队，返回占位回复
@@ -25,25 +77,12 @@ services:
       - api_data:/app/data
       - uploads_data:/app/uploads
       - ./stickers:/app/stickers
-      - ./st-data:/app/st-data
-      # ⚠️ 安全警告: Docker 套接字挂载使容器可控制宿主机 Docker
-      # 如果 api-server 被攻破，攻击者可创建任意容器
-      # 建议: 使用 Docker-in-Docker 或 Unix socket 代理替代
-      - /var/run/docker.sock:/var/run/docker.sock
-      # Docker CLI (bind-mount to avoid glibc/musl conflict)
-      - /usr/bin/docker:/usr/local/bin/docker:ro
-      - /lib64/ld-linux-x86-64.so.2:/lib64/ld-linux-x86-64.so.2:ro
-      - /usr/lib/x86_64-linux-gnu/libc.so.6:/usr/lib/x86_64-linux-gnu/libc.so.6:ro
-      - /usr/libexec/docker/cli-plugins/docker-compose:/usr/local/lib/docker/cli-plugins/docker-compose:ro
-
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     networks:
       - companion-net
     healthcheck:
@@ -52,6 +91,68 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  # ===========================================================================
+  # BullMQ Worker - 异步处理消息队列
+  # 独立进程: 读取短期记忆、长期记忆、情绪分析、调用DeepSeek、发送回复
+  # ===========================================================================
+  bull-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: weclaw-bull-worker
+    command: ["node", "--max-old-space-size=4096", "dist/worker.js"]
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    volumes:
+      - uploads_data:/app/uploads
+      - ./stickers:/app/stickers
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'node.*worker' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - companion-net
+    deploy:
+      resources:
+        limits:
+          memory: 5G
+
+  # ===========================================================================
+  # 主动关怀定时任务 - 每天8:00/13:00/20:00发送关怀消息
+  # ===========================================================================
+  care-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: weclaw-care-scheduler
+    command: ["node", "dist/care/scheduler.js"]
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'node.*scheduler' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - companion-net
 
   # ===========================================================================
   # Redis - 短期记忆存储 + BullMQ 队列后端
@@ -99,8 +200,6 @@ services:
       - ./scripts/init-db-v2.sql:/docker-entrypoint-initdb.d/02-init-v2.sql:ro
       - ./scripts/init-db-v3.sql:/docker-entrypoint-initdb.d/03-init-v3.sql:ro
       - ./scripts/init-db-v4.sql:/docker-entrypoint-initdb.d/04-init-v4.sql:ro
-      - ./scripts/init-db-v5.sql:/docker-entrypoint-initdb.d/05-init-v5.sql:ro
-      - ./scripts/init-db-v6.sql:/docker-entrypoint-initdb.d/06-init-v6.sql:ro
     restart: unless-stopped
     networks:
       - companion-net
@@ -112,39 +211,42 @@ services:
       start_period: 30s
 
   # ===========================================================================
-  # MinIO - 对象存储（可选，默认注释掉）
-  # 需要共享文件存储时取消注释。代码已有本地文件系统回退。
+  # MinIO - 对象存储 (可选，用于文件持久化)
+  # 如果不需要OSS，可以注释掉此服务
   # ===========================================================================
-  # minio:
-  #   image: minio/minio:latest
-  #   container_name: weclaw-minio
-  #   ports:
-  #     - "${MINIO_PORT:-9000}:9000"
-  #     - "${MINIO_CONSOLE_PORT:-9001}:9001"
-  #   environment:
-  #     MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
-  #     MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin123}
-  #   volumes:
-  #     - minio_data:/data
-  #   command: server /data --console-address ":9001"
-  #   restart: unless-stopped
-  #   networks:
-  #     - companion-net
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-  #     interval: 30s
-  #     timeout: 5s
-  #     retries: 3
+  minio:
+    image: minio/minio:latest
+    container_name: weclaw-minio
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin123}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    networks:
+      - companion-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ===========================================================================
+  # Nginx 反向代理 (可选)
+  # 统一入口，/api/* → Express, /uploads/* → 静态文件
+  # ===========================================================================
   nginx:
     image: nginx:alpine
     container_name: weclaw-nginx
     ports:
       - "8080:80"
-      - "8082:8082"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - uploads_data:/var/www/uploads:ro
-      - ./stickers:/usr/share/nginx/stickers:ro
     restart: unless-stopped
     depends_on:
       - api-server
@@ -152,27 +254,38 @@ services:
       - companion-net
 
   # ===========================================================================
-  # Hermes Agent - 微信消息处理 + AI角色扮演
-  # Hermes Agent - 微信消息处理 + AI角色扮演
+  # FastAgent - WeChat 消息收发 (支持webhook转发)
   # ===========================================================================
-  hermes-companion:
+  fastagent:
     build:
       context: .
-      dockerfile: hermes.Dockerfile
-    container_name: hermes-companion
+      dockerfile: fastagent.Dockerfile
+    container_name: weclaw-fastagent
     ports:
       - "18789:18789"
     volumes:
-      - hermes_data:/app/data
-      - ./hermes-config.yaml:/app/config/config.yaml:ro
-      - ./scripts/hermes-webhook-bridge.js:/app/scripts/webhook-bridge.js:ro
+      - fastagent_data:/app/data
+      - ./fastagent-config.json:/app/config/config.json:ro
     environment:
-      - HERMES_HOME=/app/data
-      - WEBHOOK_URL=http://api-server:3000/api/hermes/webhook
-      - WEIXIN_DM_POLICY=open
-      - WEIXIN_GROUP_POLICY=disabled
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - IM_GATEWAY_ALLOW_ALL_PERMISSIONS=true
+      - IM_GATEWAY_WORKSPACE_DIR=/app/data
+      - IM_GATEWAY_DATA_DIR=/app/data
+      - IM_GATEWAY_AGENT_ID=companion
+    restart: unless-stopped
+    networks:
+      - companion-net
+
+  # ===========================================================================
+  # OpeniLink Hub - 微信桥接管理平台 (支持webhook)
+  # Web UI: http://localhost:9800
+  # ===========================================================================
+  openilink-hub:
+    image: ghcr.io/openilink/openilink-hub:latest
+    container_name: weclaw-openilink
+    ports:
+      - "9800:9800"
+    volumes:
+      - openilink_data:/var/lib/openilink-hub
     restart: unless-stopped
     networks:
       - companion-net
@@ -195,18 +308,25 @@ services:
 # 持久化卷
 # =============================================================================
 volumes:
-  hermes_data:
+  openilink_data:
+    driver: local
+
+  fastagent_data:
     driver: local
   redis_data:
     driver: local
   postgres_data:
     driver: local
+  weclaw_config:
+    driver: local
   api_data:
     driver: local
   uploads_data:
     driver: local
-  # minio_data:
-  #   driver: local
+  st_data:
+    driver: local
+  minio_data:
+    driver: local
 
 # =============================================================================
 # 内部网络

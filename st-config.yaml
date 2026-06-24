@@ -1,0 +1,48 @@
+﻿# =============================================================================
+# SillyTavern 配置模板 — 用于 hermes-st-relay 直连 (HTTP REST)
+# =============================================================================
+# 将此文件放在项目根目录，Docker 会自动挂载到 ST 容器内
+# 首次启动后，可通过 Web UI (http://localhost:8000) 配置角色卡和 LLM
+#
+# 重要:
+#   1. 设置一个 apiKey，与 .env 中的 ST_API_KEY 保持一致
+#   2. 在 Web UI 中创建一个角色卡，角色名与 .env 中的 ST_CHARACTER 一致
+#   3. 在 Web UI 中配置 DeepSeek (或其它) API 连接
+# =============================================================================
+
+# 监听端口
+port: 8000
+
+# API 鉴权密钥 — relay 通过 X-API-Key header 使用此密钥调用 ST API
+# 必须与 .env 中的 ST_API_KEY 一致
+apiKey: "your-sillytavern-api-key"
+
+# 管理员密码 (用于 Web UI 登录)
+password: ""
+
+# 白名单模式 (推荐启用)
+whitelistMode: false
+
+# 允许的无鉴权访问 (白名单关闭时有效)
+allowPublicRegister: false
+
+# 数据目录
+dataDir: "./data"
+
+# 基本鉴权 (可选)
+basicAuth:
+  username: ""
+  password: ""
+  enabled: false
+
+# 请求代理 (如需要)
+# requestProxy:
+#   enabled: true
+#   url: "http://proxy:8080"
+#   bypass: "localhost,127.0.0.1"
+
+# Cookie 安全
+cookieSecret: "change-me-to-a-random-string"
+
+# 调试模式
+debug: false

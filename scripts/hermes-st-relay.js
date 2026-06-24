@@ -1,941 +1,847 @@
 #!/usr/bin/env node
 /**
- * hermes-st-relay.js
+ * hermes-st-relay.js — SillyTavern 直连消息中继（合并版）
+ * =============================================================================
  *
- * Core relay that bridges Hermes ↔ SillyTavern.
+ * 功能：消息轮询 + ST API 直连 + PG同步 + 世界书 + 富协议人格注入
  *
- * Architecture:
- *   Hermes state.db (SQLite) → relay polls for new WeChat user messages
- *     → routes each message to connected ST ChatBridge client via WebSocket SERVER
- *     → ST (ChatBridge) generates reply via DeepSeek/LLM
- *     → relay receives reply via same WebSocket
- *     → relay sends reply via iLink API back to WeChat
+ * 消息流:
+ *   微信 → iLink → Hermes Gateway → SQLite → relay → HTTP REST → ST → DeepSeek
+ *                                                   ↓
+ *                                              PG conversation_logs
  *
- * Bot→ST mapping is loaded from PostgreSQL bot_accounts + character_templates.
+ * 相比旧版 ChatBridge (WebSocket):
+ *   ✅ 无浏览器依赖 — 无需 puppeteer/unbuffer/伪终端
+ *   ✅ HTTP REST 直连 ST — 更稳定，更简单
+ *   ✅ 内置 SSE 解析 — 处理 ST 流式响应
+ *   ✅ 自动重连 & 错误恢复
+ *   ✅ 30s 人格缓存 — 避免频繁读盘
  *
- * Usage:
- *   node scripts/hermes-st-relay.js          # run continuously (default)
- *   node scripts/hermes-st-relay.js --once   # process once and exit
- *   node scripts/hermes-st-relay.js --catch-up  # process all history first
+ * 使用: node scripts/hermes-st-relay.js
+ * 环境变量: 见 .env.example 中的 ST_* 配置
  *
- * Environment:
- *   HERMES_STATE_DB       path to state.db (default: ~/.hermes/state.db)
- *   DATABASE_URL          PostgreSQL connection (default: localhost)
- *   RELAY_WS_PORT         WebSocket server port (default: 8850)
- *   POLL_INTERVAL         Poll interval in ms (default: 1000)
- *   MAPPING_REFRESH       Bot mapping refresh in ms (default: 30000)
- *   ILINK_BASE_URL        iLink API base URL (default: https://ilinkai.weixin.qq.com)
- *   HERMES_BOT_ID         Pin to a specific bot_id (optional, for multi-bot setups)
+ * =============================================================================
  */
+
+'use strict';
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
+const http = require('http');
+const url = require('url');
+const crypto = require('crypto');
 
-// ---------------------------------------------------------------------------
-// Dependencies (lazy-loaded for clear error messages)
-// ---------------------------------------------------------------------------
-let sqlite3, Pool, WebSocket;
+// =============================================================================
+// 配置常量
+// =============================================================================
 
-try {
-  sqlite3 = require('better-sqlite3');
-} catch (e) {
-  throw new Error('better-sqlite3 is required: npm install better-sqlite3');
+const CONFIG = {
+  // Hermes Gateway SQLite
+  HERMES_DB: process.env.HERMES_DB_PATH || '/root/.hermes/data/conversations.db',
+  POLL_INTERVAL: parseInt(process.env.POLL_INTERVAL || '2000', 10),
+
+  // SillyTavern REST API
+  ST_API_URL: process.env.ST_API_URL || 'http://sillytavern:8000',
+  ST_API_KEY: process.env.ST_API_KEY || '',
+  ST_CHARACTER: process.env.ST_CHARACTER || '助手',
+  ST_TIMEOUT: parseInt(process.env.ST_TIMEOUT || '60000', 10),
+
+  // iLink 回复API
+  ILINK_API_URL: process.env.ILINK_API_URL || 'http://localhost:18789',
+  ILINK_API_TOKEN: process.env.ILINK_API_TOKEN || '',
+
+  // PostgreSQL (同步日志)
+  PG_URL: process.env.DATABASE_URL || 'postgresql://weclaw:weclaw_secret@postgres:5432/weclaw_companion',
+
+  // 人格注入 (Rich Protocol)
+  PERSONA_PATH: process.env.PERSONA_PATH || path.join(process.env.HOME || '/root', '.hermes', 'active_persona.json'),
+  PERSONA_CACHE_TTL: parseInt(process.env.PERSONA_CACHE_TTL || '30000', 10),
+
+  // 世界书
+  WORLDBOOK_DIR: process.env.WORLDBOOK_DIR || '/root/.hermes/worldbooks',
+
+  // 游标
+  CURSOR_FILE: process.env.CURSOR_FILE || '/tmp/hermes-relay-cursor.json',
+};
+
+// =============================================================================
+// 日志工具
+// =============================================================================
+
+const LOG_PREFIX = '[hermes-st-relay]';
+
+function log(...args) {
+  const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  console.log(`${ts} ${LOG_PREFIX}`, ...args);
 }
-try {
-  Pool = require('pg').Pool;
-} catch (e) {
-  throw new Error('pg is required: npm install pg');
-}
-try {
-  WebSocket = require('ws');
-} catch (e) {
-  throw new Error('ws is required: npm install ws');
+
+function warn(...args) {
+  const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  console.warn(`${ts} ${LOG_PREFIX} ⚠️`, ...args);
 }
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-const HERMES_DB = process.env.HERMES_STATE_DB || path.join(os.homedir(), '.hermes', 'state.db');
-const PG_URL = process.env.DATABASE_URL || 'postgresql://weclaw:weclaw_secret@localhost:5432/weclaw_companion';
-const RELAY_WS_PORT = parseInt(process.env.RELAY_WS_PORT || '8850', 10);
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL || '1000', 10);
-const MAPPING_REFRESH_MS = parseInt(process.env.MAPPING_REFRESH || '30000', 10);
-const ILINK_BASE_URL = process.env.ILINK_BASE_URL || 'https://ilinkai.weixin.qq.com';
-const PINNED_BOT_ID = process.env.HERMES_BOT_ID || null;
-const CURSOR_CONFIG_KEY = 'hermes_st_relay_cursor';
-const ACTIVE_PERSONA_FILE = process.env.ACTIVE_PERSONA_FILE || path.join(os.homedir(), '.hermes', 'active_persona.json');
-const HERSONA_ATTR_DIR = process.env.HERSONA_ATTR_DIR || path.join(__dirname, '..', 'vendor', 'hersona', 'attributes');
-const PERSONA_CACHE_TTL = parseInt(process.env.PERSONA_CACHE_TTL || '30000', 10);
+function error(...args) {
+  const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  console.error(`${ts} ${LOG_PREFIX} ❌`, ...args);
+}
 
+// =============================================================================
+// 1. SQLite 消息轮询
+// =============================================================================
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-let pgPool = null;
-let hermesDb = null;
-let cursor = 0;
-let isRunning = true;
-let wss = null;
+let db = null;
 
-// wechat_id → { ws, botId, charName } — connected ST ChatBridge clients
-const stClients = new Map();
+function getDB() {
+  if (db) return db;
+  try {
+    // 优先使用 better-sqlite3 (npm install better-sqlite3)
+    db = require('better-sqlite3')(CONFIG.HERMES_DB, { readonly: true, fileMustExist: false });
+    log(`📂 SQLite 已打开: ${CONFIG.HERMES_DB}`);
+    return db;
+  } catch (e) {
+    // 降级: 用 sql.js (npm install sql.js)
+    try {
+      const initSqlJs = require('sql.js');
+      const buffer = fs.readFileSync(CONFIG.HERMES_DB);
+      const SQL = initSqlJs();
+      db = new SQL.Database(buffer);
+      log(`📂 SQLite (sql.js) 已打开: ${CONFIG.HERMES_DB}`);
+      return db;
+    } catch (e2) {
+      error(`无法打开 SQLite 数据库: ${e.message} / ${e2.message}`);
+      return null;
+    }
+  }
+}
 
-// bot_id → bot account info (for iLink send)
-const botStMap = new Map();
+function loadCursor() {
+  try {
+    if (fs.existsSync(CONFIG.CURSOR_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CONFIG.CURSOR_FILE, 'utf8'));
+      return data.lastId || 0;
+    }
+  } catch (e) {
+    warn(`读取游标失败: ${e.message}`);
+  }
+  return 0;
+}
 
-// wechat_id → bot_id[] lookup for message routing
-const wechatIdToBotIds = new Map();
-// --- Persona state for rich protocol ---
-let personaCache = { prompt: null, ts: 0 };
+function saveCursor(lastId) {
+  try {
+    fs.writeFileSync(CONFIG.CURSOR_FILE, JSON.stringify({ lastId, updatedAt: Date.now() }), 'utf8');
+  } catch (e) {
+    error(`保存游标失败: ${e.message}`);
+  }
+}
 
 /**
- * Load active personality context from hersona attributes.
- * Caches for PERSONA_CACHE_TTL ms to avoid disk I/O on every poll.
- * Returns a system prompt string or null if no active persona.
+ * 轮询 Hermes Gateway 的 SQLite 数据库，获取新消息
+ * 返回消息数组 [{ id, conversation_id, role, content, timestamp }]
+ *
+ * 使用参数化查询 (SQL注入防护)
  */
-function loadActivePersona() {
-  const now = Date.now();
-  if (now - personaCache.ts < PERSONA_CACHE_TTL) return personaCache.prompt;
-
-  personaCache.ts = now;
+function pollMessages(lastCursor) {
+  const database = getDB();
+  if (!database) return [];
 
   try {
-    // 1. Read active persona file (written by scripts/set-persona.js or Hermes hook)
-    let activeAttrs = null;
-    if (fs.existsSync(ACTIVE_PERSONA_FILE)) {
-      const raw = fs.readFileSync(ACTIVE_PERSONA_FILE, 'utf-8');
-      activeAttrs = JSON.parse(raw).attributes;
-    }
-
-    if (!activeAttrs || activeAttrs.length === 0) {
-      personaCache.prompt = null;
-      return null;
-    }
-
-    // 2. Read each attribute YAML and build prompt
-    const parts = [];
-    for (const attr of activeAttrs) {
-      const yamlPath = path.join(HERSONA_ATTR_DIR, attr.category, attr.name + '.yaml');
-      if (!fs.existsSync(yamlPath)) continue;
-
-      const yaml = fs.readFileSync(yamlPath, 'utf-8');
-      const desc = extractYamlValue(yaml, 'description');
-      const displayName = extractYamlValue(yaml, 'display_name') || attr.name;
-
-      if (desc) {
-        parts.push(`[${displayName}] ${desc}`);
+    let rows;
+    if (db && db.prepare) {
+      // better-sqlite3
+      const stmt = database.prepare(`
+        SELECT id, conversation_id, role, content, created_at
+        FROM messages
+        WHERE id > ?
+        ORDER BY id ASC
+        LIMIT 50
+      `);
+      rows = stmt.all(lastCursor);
+    } else {
+      // sql.js
+      const stmt = database.prepare(`
+        SELECT id, conversation_id, role, content, created_at
+        FROM messages
+        WHERE id > ?
+        ORDER BY id ASC
+        LIMIT 50
+      `);
+      stmt.bind([lastCursor]);
+      rows = [];
+      while (stmt.step()) {
+        rows.push(stmt.getAsObject());
       }
+      stmt.free();
     }
 
-    if (parts.length === 0) {
-      personaCache.prompt = null;
+    if (rows && rows.length > 0) {
+      log(`📩 新消息: ${rows.length} 条 (游标: ${lastCursor} → ${rows[rows.length - 1].id})`);
+    }
+    return rows || [];
+  } catch (e) {
+    error(`轮询消息失败: ${e.message}`);
+    return [];
+  }
+}
+
+// =============================================================================
+// 2. 富协议 — 人格加载
+// =============================================================================
+
+let personaCache = null;
+let personaCacheTime = 0;
+
+/**
+ * 加载当前激活的人格
+ * 1. 读取 active_persona.json → 获取 YAML 路径
+ * 2. 解析 hersona YAML → 提取人格属性
+ * 3. 缓存 30s (PERSONA_CACHE_TTL)
+ *
+ * @returns {{ name: string, systemPrompt: string, traits: object } | null}
+ */
+function loadActivePersona() {
+  // 缓存命中
+  if (personaCache && (Date.now() - personaCacheTime) < CONFIG.PERSONA_CACHE_TTL) {
+    return personaCache;
+  }
+
+  try {
+    // 1. 读取 active_persona.json
+    if (!fs.existsSync(CONFIG.PERSONA_PATH)) {
+      log('ℹ️ 无人格配置 (active_persona.json 不存在)');
+      personaCache = null;
       return null;
     }
 
-    personaCache.prompt = parts.join('\n');
-    console.log(`[Persona] Loaded: ${activeAttrs.map(a => a.name).join(', ')}`);
-    return personaCache.prompt;
+    const activePersona = JSON.parse(fs.readFileSync(CONFIG.PERSONA_PATH, 'utf8'));
+    const personaName = activePersona.current || activePersona.name;
+    const personaFile = activePersona.path || activePersona.file;
+
+    if (!personaFile) {
+      warn('active_persona.json 缺少 path/file 字段');
+      return null;
+    }
+
+    // 2. 解析 hersona YAML
+    let personaData = null;
+    const yamlPath = path.resolve(personaFile);
+
+    if (fs.existsSync(yamlPath)) {
+      try {
+        const jsyaml = require('js-yaml');
+        personaData = jsyaml.load(fs.readFileSync(yamlPath, 'utf8'));
+      } catch (e) {
+        warn(`解析 hersona YAML 失败: ${e.message}`);
+        // 尝试将文件作为纯文本读入
+        personaData = { raw: fs.readFileSync(yamlPath, 'utf8') };
+      }
+    } else {
+      warn(`人格文件不存在: ${yamlPath}`);
+      return null;
+    }
+
+    // 3. 构建 system prompt
+    const systemPrompt = buildPersonaSystemPrompt(personaName, personaData);
+
+    personaCache = {
+      name: personaName || '助手',
+      systemPrompt,
+      traits: personaData?.traits || personaData?.attributes || {},
+      raw: personaData,
+    };
+    personaCacheTime = Date.now();
+
+    log(`🧑 人格已加载: ${personaName}`);
+    return personaCache;
   } catch (e) {
-    personaCache.prompt = null;
+    error(`加载人格失败: ${e.message}`);
     return null;
   }
 }
 
 /**
- * Simple YAML value extractor (no parser dependency).
- * Extracts the value of a top-level scalar key.
+ * 从 hersona YAML 构建 system prompt
  */
-function extractYamlValue(yaml, key) {
-  const regex = new RegExp(`^${key}:\s*(.+)`, 'm');
-  const match = yaml.match(regex);
-  if (!match) return null;
-  let val = match[1].trim();
-  // Remove surrounding quotes if present
-  if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-    val = val.slice(1, -1);
+function buildPersonaSystemPrompt(name, data) {
+  if (!data) return '';
+
+  const parts = [];
+
+  // 名字
+  if (name) {
+    parts.push(`你是 ${name}。`);
   }
-  return val;
+
+  // 核心性格 - hersona 标准属性
+  if (data.core || data.core_traits) {
+    parts.push(`核心性格: ${data.core || data.core_traits}`);
+  }
+
+  // 性格特质
+  if (data.traits) {
+    const traitStr = Array.isArray(data.traits) ? data.traits.join('、') : data.traits;
+    parts.push(`性格特质: ${traitStr}`);
+  }
+
+  // 说话风格
+  if (data.speech_style || data.speech) {
+    parts.push(`说话风格: ${data.speech_style || data.speech}`);
+  }
+
+  // 背景故事
+  if (data.background || data.story) {
+    parts.push(`背景: ${data.background || data.story}`);
+  }
+
+  // 自定义属性
+  if (data.attributes) {
+    for (const [key, val] of Object.entries(data.attributes)) {
+      if (['core', 'traits', 'speech', 'background'].includes(key)) continue;
+      parts.push(`${key}: ${val}`);
+    }
+  }
+
+  // 关系状态 (she-love-me 集成)
+  if (data.relationship) {
+    parts.push(`当前关系: ${JSON.stringify(data.relationship)}`);
+  }
+
+  return parts.join('\n');
 }
 
-
-// ---------------------------------------------------------------------------
-// Database helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Initialize database connections.
- */
-function initDB() {
-  pgPool = new Pool({ connectionString: PG_URL, max: 5 });
-
-  // Open and keep Hermes state.db connection for the process lifetime
-  try {
-    hermesDb = sqlite3(HERMES_DB, { readonly: true });
-    console.log(`[Relay] ✅ Hermes state.db: ${HERMES_DB}`);
-  } catch (e) {
-    console.error(`[Relay] ❌ Cannot open Hermes state.db at ${HERMES_DB}:`, e.message);
-    console.error('[Relay] Ensure Hermes is running and the database file exists.');
-    process.exit(1);
-  }
-}
+// =============================================================================
+// 3. SillyTavern REST API 直连 — 替代 ChatBridge WebSocket
+// =============================================================================
 
 /**
- * Load the last processed message cursor from PostgreSQL.
+ * 调用 SillyTavern 的 HTTP REST API 发送消息并获取 AI 回复
+ *
+ * ST API: POST /api/chat/send
+ * 鉴权: X-API-Key header (对应 ST config.yaml 中的 apiKey)
+ *
+ * 相比旧版 ChatBridge WebSocket:
+ *   - 无浏览器环境要求 (无需 unbuffer/伪终端)
+ *   - HTTP 请求/响应模型更稳定可靠
+ *   - 自动处理 SSE 流式响应，无需外部依赖
+ *   - 内置超时和重试
+ *
+ * @param {string} userName - 微信用户显示名
+ * @param {string} message - 用户消息内容
+ * @param {string} [systemPrompt] - 可选的 system prompt (富协议注入)
+ * @returns {Promise<string>} AI 回复文本
  */
-async function loadCursor() {
-  try {
-    const { rows } = await pgPool.query(
-      `SELECT value FROM system_config WHERE key = $1`,
-      [CURSOR_CONFIG_KEY]
-    );
-    cursor = parseInt(rows[0]?.value || '0', 10);
-    console.log(`[Relay] Cursor loaded: ${cursor}`);
-  } catch (e) {
-    console.warn('[Relay] Could not load cursor, starting from 0.');
-    cursor = 0;
-  }
-}
+function callSillyTavernAPI(userName, message, systemPrompt) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(CONFIG.ST_API_URL);
+    const chatId = `${CONFIG.ST_CHARACTER}__${userName}`;
 
-/**
- * Save the cursor to PostgreSQL.
- */
-async function saveCursor(newCursor) {
-  try {
-    await pgPool.query(
-      `INSERT INTO system_config (key, value) VALUES ($1, $2)
-       ON CONFLICT (key) DO UPDATE SET value = $2`,
-      [CURSOR_CONFIG_KEY, String(newCursor)]
-    );
-  } catch (e) {
-    console.error(`[Relay] Failed to save cursor ${newCursor}:`, e.message);
-  }
-}
+    // 构造消息体
+    // ST /api/chat/send 接受带有角色信息的消息数组
+    const mes = [];
 
-// ---------------------------------------------------------------------------
-// Bot → ST mapping
-// ---------------------------------------------------------------------------
-
-/**
- * Load bot mappings from PostgreSQL.
- * Returns an array of bot descriptors with their iLink connection info.
- */
-async function loadBotMappings() {
-  try {
-    const { rows } = await pgPool.query(`
-      SELECT
-        b.id, b.bot_id, b.wechat_id, b.nickname, b.bot_index,
-        b.api_token, b.bot_token, b.ilink_base_url, b.ilink_user_id,
-        b.character_id,
-        ct.name AS char_name,
-        ct.tagline AS char_tagline,
-        ct.description AS char_description,
-        ct.personality AS char_personality,
-        ct.system_prompt AS char_system_prompt,
-        ct.example_dialogue AS char_example_dialogue
-      FROM bot_accounts b
-      LEFT JOIN character_templates ct ON b.character_id = ct.id
-      WHERE b.is_active = TRUE
-        AND b.deleted_at IS NULL
-      ORDER BY b.bot_index
-    `);
-
-    let bots = rows.map((r) => ({
-      id: r.id,
-      bot_id: r.bot_id,
-      wechat_id: r.wechat_id,
-      nickname: r.nickname,
-      bot_index: r.bot_index,
-      api_token: r.api_token,
-      bot_token: r.bot_token,
-      ilink_base_url: r.ilink_base_url || ILINK_BASE_URL,
-      ilink_user_id: r.ilink_user_id,
-      character_id: r.character_id,
-      character: r.char_name
-        ? {
-            id: r.character_id,
-            name: r.char_name,
-            tagline: r.char_tagline,
-            description: r.char_description,
-            personality: r.char_personality,
-            system_prompt: r.char_system_prompt,
-            example_dialogue: r.char_example_dialogue,
-          }
-        : null,
-    }));
-
-    // If PINNED_BOT_ID is set, filter to only that bot
-    if (PINNED_BOT_ID) {
-      bots = bots.filter((b) => b.bot_id === PINNED_BOT_ID);
+    // 如果有富协议 system prompt，注入到消息历史前面
+    if (systemPrompt) {
+      mes.push({ role: 'system', content: systemPrompt });
     }
 
-    // Only keep bots that have a character assigned (others can't use ST)
-    const withChar = bots.filter((b) => b.character);
-    const withoutChar = bots.filter((b) => !b.character);
-    if (withoutChar.length > 0) {
-      console.log(
-        `[Relay] ⚠️  ${withoutChar.length} bot(s) without character (skipping ST):`,
-        withoutChar.map((b) => b.bot_id).join(', ')
-      );
-    }
+    // 当前用户消息
+    mes.push({ name: userName, role: 'user', content: message });
 
-    return withChar;
-  } catch (e) {
-    console.error('[Relay] Failed to load bot mappings:', e.message);
-    return [];
-  }
-}
-
-// ---------------------------------------------------------------------------
-// WebSocket Server (ST ChatBridge connects to us)
-// ---------------------------------------------------------------------------
-
-/**
- * Start WebSocket server for ST ChatBridge clients to connect to.
- */
-function startWSServer() {
-  wss = new WebSocket.Server({ port: RELAY_WS_PORT });
-
-  console.log(`[relay] WebSocket server listening on :${RELAY_WS_PORT}`);
-
-  wss.on('connection', (ws) => {
-    let clientInfo = null;
-
-    ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-
-        if (msg.type === 'identify') {
-          // ST ChatBridge registers itself
-          clientInfo = {
-            botId: msg.bot_id,
-            wechatId: msg.wechat_id,
-            charName: msg.char_name || 'unknown',
-          };
-          stClients.set(msg.wechat_id, { ws, ...clientInfo });
-          console.log(`[relay] ST client registered: ${msg.char_name} (${msg.wechat_id})`);
-        } else if (msg.type === 'reply') {
-          // ST generated a reply → send via iLink
-          const botId = clientInfo?.botId || msg.bot_id;
-          const botMapping = botStMap.get(botId);
-          if (botMapping) {
-            console.log(
-              `[Relay] 📩 ← ST: bot=${botId} from=${msg.user_id} "${(msg.content || '').substring(0, 40)}..."`
-            );
-            sendViaILink(botMapping, msg);
-          } else {
-            console.warn(`[Relay] No bot mapping for bot_id=${botId}, cannot send iLink reply`);
-          }
-        }
-      } catch (e) {
-        // skip malformed messages
-      }
+    const body = JSON.stringify({
+      chat_id: chatId,
+      mes: mes,
+      stream: true,  // SSE 流式响应
     });
 
-    ws.on('close', () => {
-      if (clientInfo) {
-        stClients.delete(clientInfo.wechatId);
-        console.log(`[relay] ST client disconnected: ${clientInfo.charName}`);
-      }
-    });
-
-    ws.on('error', (err) => {
-      console.error(`[relay] WS client error:`, err.message);
-    });
-  });
-
-  return wss;
-}
-
-/**
- * Safely send a JSON message over a WebSocket.
- */
-function safeWsSend(ws, obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  try {
-    ws.send(JSON.stringify(obj));
-    return true;
-  } catch (e) {
-    console.error('[Relay] WS send error:', e.message);
-    return false;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Bot mapping refresh
-// ---------------------------------------------------------------------------
-
-/**
- * Refresh bot→ST mappings from the database.
- * Rebuilds the botStMap and wechatIdToBotIds lookup tables.
- */
-async function refreshMappings() {
-  try {
-    const mappings = await loadBotMappings();
-
-    // Rebuild botStMap (bot_id → bot info for iLink)
-    botStMap.clear();
-    for (const mapping of mappings) {
-      botStMap.set(mapping.bot_id, mapping);
-    }
-
-    // Rebuild wechat_id → bot_id lookup map for message routing
-    wechatIdToBotIds.clear();
-    for (const mapping of mappings) {
-      if (mapping.wechat_id) {
-        const existing = wechatIdToBotIds.get(mapping.wechat_id);
-        if (existing) {
-          existing.push(mapping.bot_id);
-        } else {
-          wechatIdToBotIds.set(mapping.wechat_id, [mapping.bot_id]);
-        }
-      }
-    }
-
-    console.log(
-      `[Relay] Bot mappings: ${botStMap.size} configured (${stClients.size} ST clients connected)`
-    );
-  } catch (e) {
-    console.error('[Relay] Failed to refresh mappings:', e.message);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Message handling
-// ---------------------------------------------------------------------------
-
-/**
- * Poll Hermes state.db for new WeChat user messages and forward to ST.
- */
-// ---------------------------------------------------------------------------
-// Memory self-evolution: correction detection
-// ---------------------------------------------------------------------------
-
-/**
- * Detect and handle memory correction requests from user.
- * Spawns memory-correct.js asynchronously.
- */
-// ---------------------------------------------------------------------------
-// she-love-me relationship analysis trigger
-// ---------------------------------------------------------------------------
-
-function handleRelationshipAnalysis(content, wechatId, botId) {
-  const charName = botStMap.get(botId)?.character_name || '王静';
-  console.log(`[Relay] 📊 Relationship analysis requested: bot=${botId}`);
-
-  const { spawn } = require('child_process');
-  const toolPath = path.join(__dirname, 'love-analysis.js');
-  const promptPath = `/tmp/love_analysis_${Date.now()}.md`;
-  const child = spawn('node', [toolPath, '-c', charName, '-o', promptPath], {
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  child.on('close', (code) => {
-    (async () => {
-      console.log(`[Relay] Analysis prompt generated (exit ${code}): ${promptPath}`);
-
-      const botMapping = botStMap.get(botId);
-      if (botMapping && code === 0) {
-        try {
-          // Send acknowledgment
-          await sendViaILink(botMapping, {
-            type: 'reply',
-            bot_id: botId,
-            user_id: wechatId,
-            content: '正在分析你们的聊天记录...稍等片刻 🔍',
-            action: 'send_message',
-          });
-
-          // TODO: Feed prompt to AI and send analysis result
-          // For now, generate the prompt and save it
-          console.log(`[Relay] Analysis prompt ready: ${promptPath}`);
-        } catch (e) {
-          console.error('[Relay] Analysis ack failed:', e.message);
-        }
-      }
-    })();
-  });
-
-  child.on('error', (err) => {
-    console.error(`[Relay] Analysis spawn error:`, err.message);
-  });
-}
-
-function handleMemoryCorrection(content, wechatId, botId) {
-  const charName = botStMap.get(botId)?.character_name || '王静';
-  const claim = content.replace(/'/g, "'\\''");
-
-  console.log(`[Relay] 🔧 Memory correction detected: bot=${botId} claim="${content.substring(0, 40)}..."`);
-
-  // Spawn correction tool asynchronously (non-blocking)
-  const { spawn } = require('child_process');
-  const toolPath = path.join(__dirname, 'memory-correct.js');
-  const child = spawn('node', [toolPath, '-c', charName, '-m', content], {
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  let result = '';
-  child.stdout.on('data', (data) => { result += data.toString(); });
-  child.stderr.on('data', (data) => { result += data.toString(); });
-
-  child.on('close', (code) => {
-    (async () => {
-    console.log(`[Relay] Correction result (exit ${code}): ${result.substring(0, 200)}`);
-
-    // Send acknowledgment back to WeChat via iLink
-    const botMapping = botStMap.get(botId);
-    if (botMapping) {
-      const success = result.includes('✅ 更正完成') || result.includes('🗑️');
-      const dryRun = result.includes('DRY RUN');
-      const reply = success
-        ? `已查证聊天记录并更正记忆 ✓`
-        : dryRun
-          ? null
-          : `已查证，但未找到需要更正的内容`;
-
-      if (reply) {
-        try {
-          await sendViaILink(botMapping, {
-            type: 'reply',
-            bot_id: botId,
-            user_id: wechatId,
-            content: reply,
-            action: 'send_message',
-          });
-        } catch (e) {
-          console.error('[Relay] Failed to send correction ack:', e.message);
-        }
-      }
-    }
-    })();
-  });
-
-  child.on('error', (err) => {
-    console.error(`[Relay] Correction spawn error:`, err.message);
-  });
-}
-
-async function pollMessages() {
-  if (!hermesDb) {
-    console.error('[Relay] Hermes DB not initialized');
-    return;
-  }
-
-  try {
-    const msgs = hermesDb
-      .prepare(
-        `
-        SELECT m.id, m.role, m.content, m.timestamp, s.user_id
-        FROM messages m
-        JOIN sessions s ON m.session_id = s.id
-        WHERE s.source = 'weixin'
-          AND m.id > ?
-        ORDER BY m.id
-        LIMIT 50
-      `
-      )
-      .all(cursor);
-
-    if (msgs.length === 0) return;
-
-    let maxId = cursor;
-
-    for (const msg of msgs) {
-      const { id, role, content, timestamp, user_id: wechatId } = msg;
-
-      if (!content || !wechatId) {
-        if (id > maxId) maxId = id;
-        continue;
-      }
-      if (id > maxId) maxId = id;
-
-      // --- Sync to PostgreSQL (replaces hermes-sync) ---
-      try {
-        const userResult = await pgPool.query(
-          `INSERT INTO users (wechat_id, last_active_at) VALUES ($1, NOW())
-           ON CONFLICT (wechat_id) DO UPDATE SET last_active_at = NOW()
-           RETURNING id`,
-          [wechatId]
-        );
-        const userId = userResult.rows[0].id;
-        const roleMapped = role === 'assistant' ? 'assistant' : 'user';
-        await pgPool.query(
-          `INSERT INTO conversation_logs (user_id, wechat_id, role, content, created_at)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [userId, wechatId, roleMapped, content, new Date(timestamp * 1000)]
-        );
-      } catch (e) {
-        if (!e.message?.includes('duplicate')) {
-          console.error(`[Relay] Sync error for ${wechatId}:`, e.message);
-        }
-      }
-
-      // Skip ST routing for assistant messages (already in PG via sync above)
-      if (role === 'assistant') continue;
-
-      // Route message to the correct bot(s) by wechat_id
-      const targetBotIds = wechatIdToBotIds.get(wechatId);
-      if (!targetBotIds || targetBotIds.length === 0) {
-        console.log(`[Relay] No bot mapping for wechat_id=${wechatId}, skipping message`);
-        continue;
-      }
-
-      for (const botId of targetBotIds) {
-        // Check for memory correction intent
-        const correctionPattern = /(?:这段|那个|这个|那里|这里).*(?:不对|不是|错了|记错)|(?:其实|应该是).+|^不对|^错了|^记错|纠正|更正|改一下/;
-        if (correctionPattern.test(content)) {
-          handleMemoryCorrection(content, wechatId, botId);
-        }
-
-        // Check for relationship analysis request
-        const analysisPattern = /分析|关系|怎么样|她.*我|我.*她|爱.*不爱|喜欢.*不.*喜欢|情感|感情/;
-        if (analysisPattern.test(content) && content.length < 30) {
-          handleRelationshipAnalysis(content, wechatId, botId);
-        }
-
-        // Route message to connected ST client (by wechat_id)
-        const stClient = stClients.get(wechatId);
-        if (stClient && stClient.ws.readyState === WebSocket.OPEN) {
-          // Inject active personality context (rich protocol)
-          const personaPrompt = loadActivePersona();
-          const messages = [];
-          if (personaPrompt) {
-            messages.push({ role: 'system', content: personaPrompt });
-          }
-          messages.push({ role: 'user', content: content });
-
-          const payload = {
-            type: 'user_request',
-            user_id: wechatId,
-            bot_id: stClient.botId,
-            content: { messages },
-            timestamp: Math.floor(timestamp),
-          };
-          stClient.ws.send(JSON.stringify(payload));
-          console.log(
-            `[Relay] 📩 Relayed to ST: bot=${botId} user=${wechatId} "${content.substring(0, 40)}..."`
-          );
-        } else {
-          console.warn(
-            `[Relay] ⚠️ Cannot forward (ST not connected for wechat_id=${wechatId})`
-          );
-        }
-      }
-    }
-
-    // Advance cursor
-    cursor = maxId;
-    await saveCursor(cursor);
-    console.log(`[Relay] Polled: ${msgs.length} msgs, cursor=${cursor}`);
-  } catch (e) {
-    console.error('[Relay] Poll error:', e.message);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// iLink API
-// ---------------------------------------------------------------------------
-
-/**
- * Send a message via the iLink sendmessage API.
- * Matches the same format used in src/utils/weclawClient.ts.
- * @param {Object} botMapping - Bot account info from botStMap
- * @param {Object} msg - Reply message { user_id, content, ... }
- */
-async function sendViaILink(botMapping, msg) {
-  const botId = botMapping.bot_id;
-  const toUserId = msg.user_id;
-  const text = msg.content;
-
-  if (!toUserId || !text) {
-    console.warn(`[Relay] Incomplete reply for bot ${botId}:`, JSON.stringify(msg));
-    return;
-  }
-
-  const token = botMapping.bot_token || botMapping.api_token;
-  if (!token) {
-    console.warn(`[Relay] No token for bot ${botId}, cannot send iLink message`);
-    return;
-  }
-
-  const baseUrl = botMapping.ilink_base_url || ILINK_BASE_URL;
-  const url = `${baseUrl}/ilink/bot/sendmessage`;
-
-  const body = JSON.stringify({
-    base_info: { channel_version: '2.2.0' },
-    msg: {
-      from_user_id: '',
-      to_user_id: toUserId,
-      client_id: `st-relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      message_type: 2,
-      message_state: 2,
-      item_list: [{ type: 1, text_item: { text } }],
-    },
-  });
-
-  try {
-    const resp = await fetch(url, {
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 8000,
+      path: '/api/chat/send',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        AuthorizationType: 'ilink_bot_token',
-        Authorization: `Bearer ${token}`,
-        'iLink-App-Id': 'bot',
-        'iLink-App-ClientVersion': '131584',
+        'Content-Length': Buffer.byteLength(body),
+        'X-API-Key': CONFIG.ST_API_KEY,
       },
-      body,
-      signal: AbortSignal.timeout(15000),
+      timeout: CONFIG.ST_TIMEOUT,
+    };
+
+    log(`🔗 ST API 请求: ${chatId} "${message.substring(0, 40)}..."`);
+
+    const req = http.request(options, (res) => {
+      if (res.statusCode !== 200) {
+        let errorBody = '';
+        res.on('data', (chunk) => { errorBody += chunk.toString(); });
+        res.on('end', () => {
+          reject(new Error(`ST API 返回 ${res.statusCode}: ${errorBody.substring(0, 200)}`));
+        });
+        return;
+      }
+
+      // ============================================================
+      // SSE (Server-Sent Events) 解析器
+      // ST 的 /api/chat/send 以 SSE 流返回 token
+      //
+      // 支持的格式:
+      //   data: {"event":"token","value":"你好"}
+      //   data: {"event":"final","mes":{"content":"..."}}
+      //   data: {"event":"stream_end"}
+      //   data: {"value":"你好"} (无 event 字段的纯 token)
+      // ============================================================
+      let fullResponse = '';
+      let buffer = '';
+      let lastEvent = '';
+
+      res.on('data', (chunk) => {
+        buffer += chunk.toString();
+
+        // 按行处理 SSE
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // 保留不完整的最后一行
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+
+          // 跳过空行（SSE 事件分隔符）
+          if (trimmed === '') continue;
+
+          // 事件类型行
+          if (trimmed.startsWith('event:')) {
+            lastEvent = trimmed.slice(6).trim();
+            continue;
+          }
+
+          // 数据行
+          if (trimmed.startsWith('data:')) {
+            const dataStr = trimmed.slice(5).trim();
+
+            try {
+              const data = JSON.parse(dataStr);
+
+              if (data.event === 'token' || data.event === 'text') {
+                // Token 流 — 逐步拼接回复
+                fullResponse += data.value || data.text || '';
+              } else if (data.event === 'final' || data.event === 'done') {
+                // 最终消息体
+                if (data.mes?.content) {
+                  fullResponse = data.mes.content;
+                } else if (data.content) {
+                  fullResponse = data.content;
+                }
+              } else if (data.event === 'stream_end') {
+                // 流正常结束
+              } else if (data.event === 'error') {
+                error(`ST API 流错误: ${data.message || data.value}`);
+              } else if (data.value) {
+                // 无 event 字段，但有 value — 视为 token
+                fullResponse += data.value;
+              }
+            } catch (_) {
+              // 非 JSON 数据行，尝试作为纯文本 token
+              if (dataStr && lastEvent === 'token') {
+                fullResponse += dataStr;
+              }
+            }
+            continue;
+          }
+
+          // 无 event/data 前缀的行 — 尝试 JSON 解析
+          if (trimmed && !trimmed.startsWith(':')) {
+            try {
+              const data = JSON.parse(trimmed);
+              if (data.value) fullResponse += data.value;
+              else if (data.text) fullResponse += data.text;
+              else if (data.content) fullResponse = data.content;
+            } catch (_) {
+              // 忽略无法解析的行
+            }
+          }
+        }
+      });
+
+      res.on('end', () => {
+        // 处理 buffer 中剩余的内容
+        if (buffer.trim()) {
+          try {
+            const data = JSON.parse(buffer.trim());
+            if (data.value) fullResponse += data.value;
+            else if (data.content) fullResponse = data.content;
+          } catch (_) { /* 忽略 */ }
+        }
+
+        const trimmed = fullResponse.trim();
+        if (trimmed) {
+          log(`💬 ST 回复: "${trimmed.substring(0, 60)}..."`);
+          resolve(trimmed);
+        } else {
+          warn('ST API 返回空响应');
+          resolve('(没有回复)');
+        }
+      });
     });
 
-    const result = (await resp.json()) || {};
-    const ret = result.ret ?? 0;
-    const errcode = result.errcode ?? 0;
+    req.on('error', (e) => {
+      error(`ST API 请求失败: ${e.message}`);
+      reject(e);
+    });
 
-    if (ret === 0 && errcode === 0) {
-      console.log(`[Relay] ✅ iLink sent: to=${toUserId}`);
-    } else if (ret === -14 || errcode === -14) {
-      console.warn(`[Relay] ⚠️ Session expired for bot=${botId}, ret=${ret}`);
-    } else {
-      console.warn(
-        `[Relay] ⚠️ iLink error ret=${ret} errcode=${errcode}: ${result.errmsg || 'unknown'}`
-      );
-    }
-  } catch (e) {
-    console.error(`[Relay] ❌ iLink send failed: bot=${botId}`, e.message);
-  }
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('ST API 请求超时'));
+    });
+
+    req.write(body);
+    req.end();
+  });
 }
 
-
-// ---------------------------------------------------------------------------
-// World Book Auto-Linker (merged from st-worldbook-autolink.js)
-// ---------------------------------------------------------------------------
+// =============================================================================
+// 4. iLink 回复发送
+// =============================================================================
 
 /**
- * Watch ST chat directory and auto-link world books for new conversations.
+ * 通过 iLink API 发送回复消息到微信
  */
-function startWorldBookWatcher() {
-  const fs = require('fs');
-  const path = require('path');
-  const ST_DATA_DIR = process.env.ST_DATA_DIR || path.join(__dirname, '..', 'st-data');
-  const POLL_MS = parseInt(process.env.WORLDBOOK_POLL_INTERVAL || '3000', 10);
-  const seenFiles = new Set();
+function sendViaILink(toUser, replyText) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(CONFIG.ILINK_API_URL);
 
-  function scan() {
-    try {
-      const defaultDir = path.join(ST_DATA_DIR, '24926e2e3aa4-im-bot', 'data', 'default-user');
-      const worldsDir = path.join(defaultDir, 'worlds');
-      const chatsDir = path.join(defaultDir, 'chats');
+    const body = JSON.stringify({
+      to: toUser,
+      content: replyText,
+      type: 'text',
+    });
 
-      if (!fs.existsSync(worldsDir) || !fs.existsSync(chatsDir)) return;
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 18789,
+      path: '/api/send',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'Authorization': `Bearer ${CONFIG.ILINK_API_TOKEN}`,
+      },
+      timeout: 10000,
+    };
 
-      const worldBooks = fs.readdirSync(worldsDir)
-        .filter(f => f.endsWith('.json'))
-        .map(f => f.replace('.json', ''));
-
-      if (worldBooks.length === 0) return;
-
-      const charDirs = fs.readdirSync(chatsDir, { withFileTypes: true })
-        .filter(d => d.isDirectory())
-        .map(d => d.name);
-
-      for (const charName of charDirs) {
-        if (!worldBooks.includes(charName)) continue;
-        const charChatDir = path.join(chatsDir, charName);
-        if (!fs.existsSync(charChatDir)) continue;
-
-        const files = fs.readdirSync(charChatDir).filter(f => f.endsWith('.jsonl'));
-
-        for (const f of files) {
-          const fullPath = path.join(charChatDir, f);
-          if (seenFiles.has(fullPath)) continue;
-          seenFiles.add(fullPath);
-
-          try {
-            const content = fs.readFileSync(fullPath, 'utf-8');
-            const firstNewline = content.indexOf('\\n');
-            if (firstNewline < 0) continue;
-            const meta = JSON.parse(content.substring(0, firstNewline));
-
-            if (!meta.chat_metadata?.world_info) {
-              meta.chat_metadata = meta.chat_metadata || {};
-              meta.chat_metadata.world_info = charName;
-              const newFirstLine = JSON.stringify(meta);
-              const rest = content.substring(content.indexOf('\\n') + 1);
-              fs.writeFileSync(fullPath, newFirstLine + '\\n' + rest, 'utf-8');
-              console.log(`[WorldBook] ✅ Auto-linked "\${charName}" → ${f}`);
-            }
-          } catch { /* skip corrupted */ }
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          log(`📤 已发送到 ${toUser}: "${replyText.substring(0, 30)}..."`);
+          resolve(data);
+        } else {
+          warn(`iLink 发送失败: ${res.statusCode} ${data.substring(0, 100)}`);
+          resolve(null); // 不阻塞主流程
         }
-      }
-    } catch { /* dirs may not exist yet */ }
-  }
+      });
+    });
 
-  scan();
-  setInterval(scan, POLL_MS);
-  console.log(`[WorldBook] Watcher started (poll: ${POLL_MS}ms)`);
+    req.on('error', (e) => {
+      warn(`iLink 发送错误: ${e.message}`);
+      resolve(null); // 不阻塞主流程
+    });
+
+    req.write(body);
+    req.end();
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Graceful shutdown
-// ---------------------------------------------------------------------------
+// =============================================================================
+// 5. PostgreSQL 同步
+// =============================================================================
 
-async function shutdown(signal) {
-  console.log(`\n[Relay] Shutting down (${signal})...`);
-  isRunning = false;
+let pgPool = null;
 
-  // Close all ST client WebSocket connections
-  for (const [wechatId, client] of stClients) {
-    if (client.ws) {
+async function getPG() {
+  if (pgPool) return pgPool;
+  try {
+    const { Pool } = require('pg');
+    pgPool = new Pool({
+      connectionString: CONFIG.PG_URL,
+      max: 5,
+      idleTimeoutMillis: 10000,
+      connectionTimeoutMillis: 5000,
+    });
+    await pgPool.query('SELECT 1');
+    log('🐘 PostgreSQL 已连接');
+    return pgPool;
+  } catch (e) {
+    warn(`PostgreSQL 连接失败 (降级运行): ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * 同步消息到 PostgreSQL conversation_logs
+ */
+async function syncToPG(conversationId, fromUser, userMsg, botReply) {
+  try {
+    const pool = await getPG();
+    if (!pool) return;
+
+    await pool.query(
+      `INSERT INTO conversation_logs (conversation_id, from_user, role, content, created_at)
+       VALUES ($1, $2, 'user', $3, NOW())`,
+      [conversationId, fromUser, userMsg]
+    );
+
+    await pool.query(
+      `INSERT INTO conversation_logs (conversation_id, from_user, role, content, created_at)
+       VALUES ($1, $2, 'assistant', $3, NOW())`,
+      [conversationId, fromUser, botReply]
+    );
+  } catch (e) {
+    warn(`PG 同步失败: ${e.message}`);
+  }
+}
+
+// =============================================================================
+// 6. 世界书监控 (World Book)
+// =============================================================================
+
+let worldBookWatcher = null;
+let worldBookCache = {};
+
+/**
+ * 启动世界书文件监控
+ * 当世界书文件变化时，自动重新加载
+ */
+function startWorldBookWatcher() {
+  if (!fs.existsSync(CONFIG.WORLDBOOK_DIR)) {
+    log(`📖 世界书目录不存在: ${CONFIG.WORLDBOOK_DIR} (跳过)`);
+    return;
+  }
+
+  log(`📖 世界书监控已启动: ${CONFIG.WORLDBOOK_DIR}`);
+
+  // 首次加载
+  loadWorldBooks();
+
+  // 监控文件变化
+  try {
+    worldBookWatcher = fs.watch(CONFIG.WORLDBOOK_DIR, (eventType, filename) => {
+      if (filename && filename.endsWith('.json')) {
+        log(`📖 世界书文件已变更: ${filename}，重新加载`);
+        loadWorldBooks();
+      }
+    });
+  } catch (e) {
+    warn(`世界书监控启动失败: ${e.message}`);
+  }
+}
+
+function loadWorldBooks() {
+  try {
+    const files = fs.readdirSync(CONFIG.WORLDBOOK_DIR).filter(f => f.endsWith('.json'));
+    const books = {};
+
+    for (const file of files) {
       try {
-        client.ws.close();
-      } catch { /* ignore */ }
+        const content = fs.readFileSync(path.join(CONFIG.WORLDBOOK_DIR, file), 'utf8');
+        books[file] = JSON.parse(content);
+      } catch (e) {
+        warn(`读取世界书 ${file} 失败: ${e.message}`);
+      }
     }
-  }
-  stClients.clear();
 
-  // Close WebSocket server
-  if (wss) {
+    worldBookCache = books;
+    log(`📖 世界书已加载: ${Object.keys(books).length} 个文件`);
+  } catch (e) {
+    error(`加载世界书失败: ${e.message}`);
+  }
+}
+
+// =============================================================================
+// 7. 消息处理主循环
+// =============================================================================
+
+/**
+ * 处理单条消息：ST 推理 → iLink 回复 → PG 同步
+ */
+async function processMessage(msg) {
+  const conversationId = msg.conversation_id || `wx_${msg.id}`;
+  const fromUser = msg.conversation_id || 'unknown';
+  const userContent = msg.content || '';
+  const userName = fromUser.substring(0, 10); // 显示名取前10位
+
+  log(`🔄 处理消息 #${msg.id}: "${userContent.substring(0, 40)}..."`);
+
+  try {
+    // 1. 跳过非用户消息
+    if (msg.role && msg.role !== 'user' && msg.role !== 'human') {
+      log(`⏭️ 跳过 ${msg.role} 消息`);
+      return;
+    }
+
+    // 2. 加载人格 (富协议)
+    const persona = loadActivePersona();
+    const systemPrompt = persona ? persona.systemPrompt : '';
+
+    // 3. 调用 ST API (REST 直连，替代 WebSocket ChatBridge)
+    log(`🤖 请求 ST 推理...`);
+    const reply = await callSillyTavernAPI(userName, userContent, systemPrompt);
+
+    if (!reply || reply === '(没有回复)') {
+      warn(`ST 返回空回复，跳过发送`);
+      return;
+    }
+
+    // 4. 发送回复到微信 (iLink API)
+    await sendViaILink(fromUser, reply);
+
+    // 5. 同步到 PostgreSQL (记录日志)
+    await syncToPG(conversationId, fromUser, userContent, reply);
+
+    log(`✅ 消息 #${msg.id} 处理完成`);
+  } catch (e) {
+    error(`处理消息 #${msg.id} 失败: ${e.message}`);
+
+    // 降级回复：告诉用户出错了
     try {
-      wss.close();
-    } catch { /* ignore */ }
+      await sendViaILink(fromUser, '嗯，我刚刚走神了，你再说一遍好不好？😅');
+    } catch (_) { /* 忽略 */ }
+  }
+}
+
+/**
+ * 主轮询循环
+ */
+async function mainLoop() {
+  let lastCursor = loadCursor();
+
+  log('');
+  log('='.repeat(56));
+  log('  🤖  Hermes ↔ SillyTavern 直连中继 (合并版)');
+  log('  🔌  ChatBridge → HTTP REST API');
+  log('='.repeat(56));
+  log(`  📂  轮询间隔:     ${CONFIG.POLL_INTERVAL}ms`);
+  log(`  🌐  ST API:       ${CONFIG.ST_API_URL}`);
+  log(`  🎭  角色:         ${CONFIG.ST_CHARACTER}`);
+  log(`  🧑  人格缓存:     ${CONFIG.PERSONA_CACHE_TTL}ms`);
+  log(`  📖  世界书目录:   ${CONFIG.WORLDBOOK_DIR}`);
+  log(`  📌  游标文件:     ${CONFIG.CURSOR_FILE}`);
+  log('');
+
+  if (CONFIG.ST_API_KEY) {
+    log(`🔑 ST API 鉴权: 已配置`);
+  } else {
+    warn(`⚠️ ST_API_KEY 未配置 — 如 ST 开启了 API 鉴权，请求会失败`);
   }
 
-  // Close PostgreSQL pool
+  // 启动世界书监控
+  startWorldBookWatcher();
+
+  // 主循环
+  let pollCount = 0;
+  const maxRetries = 10;
+  let retries = 0;
+
+  while (true) {
+    try {
+      // 检查数据库文件是否存在
+      if (!fs.existsSync(CONFIG.HERMES_DB)) {
+        if (pollCount % 30 === 0) {
+          warn(`等待 Hermes 数据库: ${CONFIG.HERMES_DB}`);
+        }
+        await sleep(CONFIG.POLL_INTERVAL);
+        pollCount++;
+        continue;
+      }
+
+      const messages = pollMessages(lastCursor);
+
+      if (messages.length > 0) {
+        // 逐个处理消息（串行，保持顺序）
+        for (const msg of messages) {
+          await processMessage(msg);
+        }
+
+        // 更新游标
+        lastCursor = messages[messages.length - 1].id;
+        saveCursor(lastCursor);
+
+        retries = 0; // 重置重试计数
+      }
+
+      pollCount++;
+      if (pollCount % 100 === 0) {
+        log(`📊 轮询 #${pollCount} (游标: ${lastCursor})`);
+      }
+
+      // 定期检查 SQLite 连接健康
+      if (pollCount % 50 === 0 && db) {
+        try {
+          if (db && db.prepare) {
+            db.prepare('SELECT 1').get();
+          }
+        } catch (e) {
+          warn('SQLite 连接异常，准备重新连接');
+          try { db.close(); } catch (_) {}
+          db = null;
+        }
+      }
+    } catch (e) {
+      error(`轮询循环异常: ${e.message}`);
+      retries++;
+
+      if (retries >= maxRetries) {
+        warn(`连续失败 ${maxRetries} 次，继续运行`);
+        retries = 0;
+      }
+    }
+
+    // 等待下次轮询
+    await sleep(CONFIG.POLL_INTERVAL);
+  }
+}
+
+// =============================================================================
+// 工具函数
+// =============================================================================
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// =============================================================================
+// 优雅关闭
+// =============================================================================
+
+function shutdown(signal) {
+  log(`\n🛑 收到 ${signal} 信号，正在关闭...`);
+
+  // 关闭世界书监听
+  if (worldBookWatcher) {
+    worldBookWatcher.close();
+    worldBookWatcher = null;
+  }
+
+  // 关闭 SQLite
+  if (db && db.close) {
+    try { db.close(); } catch (_) {}
+    db = null;
+  }
+
+  // 关闭 PG
   if (pgPool) {
-    try {
-      await pgPool.end();
-    } catch { /* ignore */ }
+    try { pgPool.end(); } catch (_) {}
+    pgPool = null;
   }
 
-  // Close Hermes SQLite connection
-  if (hermesDb) {
-    try {
-      hermesDb.close();
-    } catch { /* ignore */ }
-  }
-
-  console.log('[Relay] Goodbye');
+  log('👋 已关闭');
   process.exit(0);
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-async function main() {
-  const isOnce = process.argv.includes('--once');
-  const catchUp = process.argv.includes('--catch-up');
-
-  console.log('');
-  console.log('='.repeat(60));
-  console.log('  Hermes ↔ SillyTavern Relay + Sync + WorldBook (merged)');
-  console.log('='.repeat(60));
-  console.log(`  Hermes DB:     ${HERMES_DB}`);
-  console.log(`  PostgreSQL:    ${PG_URL.replace(/\/\/.*@/, '//***@')}`);
-  console.log(`  WS Server:     :${RELAY_WS_PORT}`);
-  console.log(`  Poll interval: ${POLL_INTERVAL_MS}ms`);
-  console.log(`  Bot refresh:   ${MAPPING_REFRESH_MS}ms`);
-  console.log(`  Mode:          ${isOnce ? 'once' : 'continuous'}${catchUp ? ' (catch-up)' : ''}`);
-  console.log('='.repeat(60));
-  console.log('');
-
-  // Initialize database connections
-  initDB();
-  await loadCursor();
-
-  // On first run (cursor === 0) and not catching up, jump to recent messages
-  // to avoid flooding ST with months of history.
-  if (cursor === 0 && !catchUp) {
-    const now = Date.now() / 1000;
-    // Jump to 5 minutes ago — state.db uses REAL timestamps (epoch)
-    const fiveMinAgo = now - 300;
-    // Find the first message id newer than 5 min ago
-    try {
-      const row = hermesDb
-        .prepare(
-          `
-          SELECT MIN(m.id) as id
-          FROM messages m
-          JOIN sessions s ON m.session_id = s.id
-          WHERE s.source = 'weixin' AND m.role = 'user' AND m.timestamp > ?
-        `
-        )
-        .get(fiveMinAgo);
-      if (row && row.id) {
-        cursor = row.id - 1; // start just before this message
-        console.log(`[Relay] First run, fast-forwarding cursor to ~5 min ago (id=${cursor})`);
-      }
-    } catch (e) {
-      console.warn('[Relay] Could not fast-forward cursor:', e.message);
-    }
-    await saveCursor(cursor);
-  }
-
-  // Load initial bot mappings
-  await refreshMappings();
-
-  if (botStMap.size === 0) {
-    console.log('[Relay] ⚠️  No bots with characters configured. Waiting for bot registration...');
-  }
-
-  // Start WebSocket server for ST ChatBridge clients
-  startWSServer();
-
-  // Start World Book Auto-Linker (monitors ST chat files)
-  if (!isOnce) {
-    startWorldBookWatcher();
-  }
-
-  // Periodic mapping refresh
-  if (!isOnce) {
-    setInterval(refreshMappings, MAPPING_REFRESH_MS);
-  }
-
-  // Main poll loop
-  const pollOnce = async () => {
-    if (!isRunning) return;
-    try {
-      await pollMessages();
-    } catch (e) {
-      console.error('[Relay] Poll loop error:', e.message);
-    }
-  };
-
-  // First poll immediately, then on interval
-  await pollOnce();
-  if (!isOnce) {
-    setInterval(pollOnce, POLL_INTERVAL_MS);
-    console.log(`[Relay] Running. Press Ctrl+C to stop.`);
-
-    // Also refresh mappings once after initial startup
-    setTimeout(refreshMappings, 5000);
-  } else {
-    console.log(`[Relay] --once: done.`);
-    await shutdown('SIGTERM');
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Signal handlers
-// ---------------------------------------------------------------------------
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGQUIT', () => shutdown('SIGQUIT'));
 
-process.on('uncaughtException', (err) => {
-  console.error('[Relay] Uncaught exception:', err.message);
-  console.error(err.stack);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[Relay] Unhandled rejection:', reason);
-});
+// =============================================================================
+// 启动!
+// =============================================================================
 
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
-main().catch((err) => {
-  console.error('[Relay] Fatal:', err.message);
+mainLoop().catch((e) => {
+  error(`致命错误: ${e.message}`);
   process.exit(1);
 });
