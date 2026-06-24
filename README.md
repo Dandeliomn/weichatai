@@ -177,6 +177,14 @@ bash scripts/install-skills.sh --dry-run
 | `/webhook` | POST | 微信消息入口 |
 | `/health` | GET | 健康检查 |
 
+
+
+## 设计文档
+
+| 文档 | 说明 |
+|------|------|
+| [富协议设计](docs/superpowers/specs/rich-protocol-design.md) | 人格上下文从 hersona → relay → ST 的完整链路 |
+| [SillyTavern 接入设计](docs/superpowers/specs/2026-06-22-sillytavern-integration-design.md) | ST 集成方案 |
 ## 数据库
 
 | 表 | 用途 |
