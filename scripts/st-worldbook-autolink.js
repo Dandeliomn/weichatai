@@ -3,6 +3,14 @@
  * ST World Book Auto-Linker
  * 监控ST聊天目录，新建聊天时自动挂载对应角色的世界书
  *
+ * [DEPRECATED] — 此功能已合并到 scripts/hermes-st-relay.js 的 startWorldBookWatcher() 中。
+ * relay 启动时自动运行世界书监控，不再需要独立进程。
+ * systemd 服务 hermes-st-worldbook.service 可以停用。
+ */
+/**
+ * ST World Book Auto-Linker
+ * 监控ST聊天目录，新建聊天时自动挂载对应角色的世界书
+ *
  * 用法: node scripts/st-worldbook-autolink.js
  * systemd: hermes-st-worldbook.service
  */
