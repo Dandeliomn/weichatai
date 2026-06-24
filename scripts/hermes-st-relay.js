@@ -193,13 +193,87 @@ function pollMessages(lastCursor) {
 let personaCache = null;
 let personaCacheTime = 0;
 
+// =============================================================================
+// 人格反馈检测 (Plan A: 微信聊天式打磨)
+// =============================================================================
+
+const PERSONA_FEEDBACK_RULES = [
+  // warmth
+  { test: (t) => /太热情|别这么热/.test(t), param: 'warmth', delta: -0.1 },
+  { test: (t) => /热情点|别这么冷|温柔点/.test(t), param: 'warmth', delta: 0.1 },
+  { test: (t) => /冷漠|太冷了/.test(t), param: 'warmth', delta: -0.1 },
+  // talkativeness
+  { test: (t) => /话太多|少说点|话少/.test(t), param: 'talkativeness', delta: -0.1 },
+  { test: (t) => /多说话|说多点|话多/.test(t), param: 'talkativeness', delta: 0.1 },
+  // reply_length
+  { test: (t) => /太长了|写短|短一点/.test(t), param: 'reply_length', delta: -0.1 },
+  { test: (t) => /详细|具体|写长/.test(t), param: 'reply_length', delta: 0.1 },
+  // playfulness
+  { test: (t) => /太皮|严肃|别闹/.test(t), param: 'playfulness', delta: -0.1 },
+  { test: (t) => /有趣|皮一点|开玩笑/.test(t), param: 'playfulness', delta: 0.1 },
+  // patience
+  { test: (t) => /没耐心/.test(t), param: 'patience', delta: -0.1 },
+  { test: (t) => /耐心点/.test(t), param: 'patience', delta: 0.1 },
+  // affection
+  { test: (t) => /太粘|别这么近|太亲近/.test(t), param: 'affection', delta: -0.1 },
+  { test: (t) => /亲密|撒娇|更甜|温柔点/.test(t), param: 'affection', delta: 0.1 },
+];
+
+const DEFAULT_PARAMETERS = {
+  talkativeness: 0.5, warmth: 0.5, reply_length: 0.5,
+  playfulness: 0.5, patience: 0.5, affection: 0.5,
+};
+
+function detectPersonaFeedback(text) {
+  // Quick check: does the message look like persona feedback?
+  const triggers = ['太', '点', '别', '少', '多', '更'];
+  return triggers.some(p => text.includes(p));
+}
+
+function parsePersonaFeedback(text) {
+  for (const rule of PERSONA_FEEDBACK_RULES) {
+    if (rule.test(text)) {
+      return { parameter: rule.param, delta: rule.delta };
+    }
+  }
+  return null;
+}
+
+function applyPersonaFeedback(feedback) {
+  try {
+    if (!fs.existsSync(CONFIG.PERSONA_PATH)) {
+      // Initialize if missing
+      const init = { parameters: { ...DEFAULT_PARAMETERS }, catchphrases: [], updated_by: 'wechat', updated_at: new Date().toISOString() };
+      fs.writeFileSync(CONFIG.PERSONA_PATH, JSON.stringify(init, null, 2), 'utf8');
+    }
+    const data = JSON.parse(fs.readFileSync(CONFIG.PERSONA_PATH, 'utf8'));
+    if (!data.parameters) data.parameters = { ...DEFAULT_PARAMETERS };
+    for (const [k, v] of Object.entries(DEFAULT_PARAMETERS)) {
+      if (data.parameters[k] == null) data.parameters[k] = v;
+    }
+    const current = data.parameters[feedback.parameter] ?? 0.5;
+    data.parameters[feedback.parameter] = Math.round(Math.min(1, Math.max(0, current + feedback.delta)) * 10) / 10;
+    data.updated_by = 'wechat';
+    data.updated_at = new Date().toISOString();
+    fs.writeFileSync(CONFIG.PERSONA_PATH, JSON.stringify(data, null, 2), 'utf8');
+    return true;
+  } catch (e) {
+    error(`调整人格参数失败: ${e.message}`);
+    return false;
+  }
+}
+
+// =============================================================================
+// 人格加载
+// =============================================================================
+
 /**
  * 加载当前激活的人格 (兼容 set-persona.js 的 attributes 数组格式)
- * 1. 读取 active_persona.json → 获取属性列表
+ * 1. 读取 active_persona.json → 获取属性列表 + 参数
  * 2. 逐个解析 hersona YAML → 提取人格属性
  * 3. 组合为 system prompt，缓存 30s
  *
- * @returns {{ name: string, systemPrompt: string, traits: object } | null}
+ * @returns {{ name: string, systemPrompt: string, traits: object, parameters: object, catchphrases: string[] } | null}
  */
 function loadActivePersona() {
   // 缓存命中
@@ -236,8 +310,15 @@ function loadActivePersona() {
       }
 
       if (allYamls.length > 0) {
-        const systemPrompt = buildCombinedPersonaPrompt(personaName || '助手', allYamls);
-        personaCache = { name: personaName || '助手', systemPrompt, traits: allYamls, raw: allYamls };
+        const systemPrompt = buildCombinedPersonaPrompt(
+          personaName || '助手', allYamls,
+          activePersona.parameters, activePersona.catchphrases
+        );
+        personaCache = {
+          name: personaName || '助手', systemPrompt,
+          traits: allYamls, raw: allYamls,
+          parameters: activePersona.parameters, catchphrases: activePersona.catchphrases
+        };
         personaCacheTime = Date.now();
         log(`🧑 人格已加载: ${activePersona.attributes.map(a => a.name).join(', ')}`);
         return personaCache;
@@ -273,7 +354,7 @@ function loadActivePersona() {
 /**
  * 从多个 hersona YAML 构建组合 system prompt (新格式)
  */
-function buildCombinedPersonaPrompt(name, yamls) {
+function buildCombinedPersonaPrompt(name, yamls, parameters, catchphrases) {
   const parts = [`你是 ${name}。`];
 
   // 收集所有核心特质
@@ -308,6 +389,33 @@ function buildCombinedPersonaPrompt(name, yamls) {
   const descs = yamls.map(y => y.description || '').filter(Boolean);
   if (descs.length > 0) {
     parts.push(`\n【属性说明】\n${descs.join('\n')}`);
+  }
+
+  // ---- 行为参数 (Plan A/B 共享) ----
+  if (parameters) {
+    const behaviorLines = [];
+    const rules = [
+      { key: 'talkativeness', low: '你话比较少，除非被问到否则不会主动说很多', mid: '你话量适中，该说的时候会说', high: '你话比较多，喜欢分享自己的想法和感受' },
+      { key: 'warmth', low: '你态度偏冷，不会表现太多热情', mid: '你态度温和，不冷不热', high: '你非常热情，让对方感受到你的温度' },
+      { key: 'reply_length', low: '你回复简短，几句话内结束', mid: '你回复长度适中', high: '你回复详细，会展开分享' },
+      { key: 'playfulness', low: '你比较严肃正经，不开玩笑', mid: '你偶尔会开开玩笑', high: '你很俏皮，喜欢逗对方开心' },
+      { key: 'patience', low: '你耐心有限，容易不耐烦', mid: '你比较有耐心', high: '你非常有耐心，会认真回应对方' },
+      { key: 'affection', low: '你保持距离，不会表现亲密', mid: '你态度友好但不逾矩', high: '你很亲近，不吝啬表达好感' },
+    ];
+    for (const r of rules) {
+      const v = parameters[r.key];
+      if (v != null) {
+        behaviorLines.push(`- ${v < 0.3 ? r.low : v < 0.7 ? r.mid : r.high}`);
+      }
+    }
+    if (behaviorLines.length > 0) {
+      parts.push(`\n【行为参数】\n${behaviorLines.join('\n')}`);
+    }
+  }
+
+  // ---- 自定义口头禅 ----
+  if (Array.isArray(catchphrases) && catchphrases.length > 0) {
+    parts.push(`\n【自定义口头禅】\n${catchphrases.map(p => `- ${p}`).join('\n')}`);
   }
 
   return parts.join('\n');
@@ -767,6 +875,20 @@ async function processMessage(msg) {
     if (msg.role && msg.role !== 'user' && msg.role !== 'human') {
       log(`⏭️ 跳过 ${msg.role} 消息`);
       return;
+    }
+
+    // 1.5 人格反馈检测 (Plan A)
+    if (detectPersonaFeedback(userContent)) {
+      const feedback = parsePersonaFeedback(userContent);
+      if (feedback) {
+        const success = applyPersonaFeedback(feedback);
+        if (success) {
+          personaCache = null; // 强制下次重新加载
+          log(`🎭 人格已调整: ${feedback.parameter} ${feedback.delta > 0 ? '+' : ''}${feedback.delta}`);
+          // 元命令不调用 ST API，直接返回
+          return;
+        }
+      }
     }
 
     // 2. 加载人格 (富协议) + 世界书

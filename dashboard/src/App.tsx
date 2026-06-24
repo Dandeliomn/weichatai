@@ -18,6 +18,7 @@ import AdminLogs from './pages/AdminLogs';
 import Register from './pages/Register';
 import BridgePage from './pages/BridgePage';
 import Stickers from './pages/Stickers';
+import Persona from './pages/Persona';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -43,6 +44,7 @@ function AppRoutes() {
         <Route path="/import" element={<ImportChat />} />
         <Route path="/stickers" element={<Stickers />} />
         <Route path="/bridge" element={<BridgePage />} />
+          <Route path="/persona" element={<Persona />} />
         <Route path="/settings" element={<Settings />} />
       </Route>
     </Routes>

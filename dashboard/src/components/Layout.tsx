@@ -28,6 +28,7 @@ export default function Layout() {
     { key: '/', icon: <DashboardOutlined />, label: '首页概览' },
     { key: '/profile', icon: <UserOutlined />, label: '我的' },
     { key: '/characters', icon: <SmileOutlined />, label: '角色管理' },
+    { key: '/persona', icon: <SmileOutlined />, label: '人格调校' },
     { key: '/bridge', icon: <LinkOutlined />, label: '微信桥接' },
     { key: '/import', icon: <ImportOutlined />, label: '聊天导入' },
     { key: '/stickers', icon: <PictureOutlined />, label: '表情包' },

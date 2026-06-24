@@ -29,6 +29,7 @@ import characterRouter, { initCharacterRoutes } from './routes/characters';
 import bridgeRouter, { initBridgeRoutes } from './routes/bridge';
 import stManager from './routes/st-manager';
 import initCorrectionRoutes from './routes/correction';
+import initPersonaRoutes from './routes/persona';
 
 // =============================================================================
 // 配置常量
@@ -329,6 +330,7 @@ app.use('/api/characters', characterRouter);
 app.use('/api', bridgeRouter);
 app.use('/api/st', stManager);
 app.use('/api/memory', initCorrectionRoutes(pgPool));
+app.use('/api/persona', initPersonaRoutes());
 
 // =============================================================================
 // 404 处理
