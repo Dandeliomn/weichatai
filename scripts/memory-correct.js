@@ -19,7 +19,7 @@ const path = require('path');
 // Config
 // ============================================================
 
-const ST_CONTAINER = 'weclaw-st-24926e2e3aa4-im-bot';
+const ST_CONTAINER = process.env.ST_CONTAINER_NAME || 'weclaw-st-24926e2e3aa4-im-bot';
 const ST_DATA_HOST = '/app/st-data/24926e2e3aa4-im-bot/data/default-user';
 const EXES_DIR = path.resolve(__dirname, '..', 'exes');
 
