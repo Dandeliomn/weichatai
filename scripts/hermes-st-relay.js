@@ -36,6 +36,9 @@ const crypto = require('crypto');
 // =============================================================================
 
 const CONFIG = {
+  // 🔒 开发模式 — 设为 true 时跳过所有 LLM 调用，返回模拟回复
+  DEV_MODE: process.env.DEV_MODE === 'true',
+
   // Hermes Gateway SQLite
   HERMES_DB: process.env.HERMES_DB_PATH || '/root/.hermes/data/conversations.db',
   POLL_INTERVAL: parseInt(process.env.POLL_INTERVAL || '2000', 10),
@@ -418,6 +421,13 @@ function callSillyTavernAPI(userName, message, systemPrompt) {
     };
 
     log(`🔗 ST API 请求: ${chatId} "${message.substring(0, 40)}..."`);
+
+  // 🛡️ 开发模式：跳过真实 LLM 调用，返回模拟回复
+  if (CONFIG.DEV_MODE) {
+    log('⚠️ DEV_MODE 开启，返回模拟回复');
+    resolve(`[开发模式] 你说了: "${message.substring(0, 30)}"，这是模拟回复，未调用 DeepSeek。`);
+    return;
+  }
 
     const req = http.request(options, (res) => {
       if (res.statusCode !== 200) {
