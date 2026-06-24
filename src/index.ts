@@ -374,7 +374,7 @@ async function start() {
       console.log(`  🚀  服务地址:    http://0.0.0.0:${PORT}`);
       console.log(`  📋  健康检查:    http://0.0.0.0:${PORT}/health`);
       console.log(`  📊  队列统计:    http://0.0.0.0:${PORT}/stats`);
-      console.log(`  📩  Webhook:     POST /webhook`);
+      console.log(`  📩 消息入口:     POST /webhook`);
       console.log(`  🔐  认证API:     /api/auth/*`);
       console.log(`  👤  用户API:     /api/user/*`);
       console.log(`  🛡️  管理API:    /api/admin/*`);
