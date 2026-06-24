@@ -454,7 +454,6 @@ async function pollMessages() {
         FROM messages m
         JOIN sessions s ON m.session_id = s.id
         WHERE s.source = 'weixin'
-          AND m.role = 'user'
           AND m.id > ?
         ORDER BY m.id
         LIMIT 50
@@ -467,13 +466,37 @@ async function pollMessages() {
     let maxId = cursor;
 
     for (const msg of msgs) {
-      const { id, content, timestamp, user_id: wechatId } = msg;
+      const { id, role, content, timestamp, user_id: wechatId } = msg;
 
       if (!content || !wechatId) {
         if (id > maxId) maxId = id;
         continue;
       }
       if (id > maxId) maxId = id;
+
+      // --- Sync to PostgreSQL (replaces hermes-sync) ---
+      try {
+        const userResult = await pgPool.query(
+          `INSERT INTO users (wechat_id, last_active_at) VALUES ($1, NOW())
+           ON CONFLICT (wechat_id) DO UPDATE SET last_active_at = NOW()
+           RETURNING id`,
+          [wechatId]
+        );
+        const userId = userResult.rows[0].id;
+        const roleMapped = role === 'assistant' ? 'assistant' : 'user';
+        await pgPool.query(
+          `INSERT INTO conversation_logs (user_id, wechat_id, role, content, created_at)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [userId, wechatId, roleMapped, content, new Date(timestamp * 1000)]
+        );
+      } catch (e) {
+        if (!e.message?.includes('duplicate')) {
+          console.error(`[Relay] Sync error for ${wechatId}:`, e.message);
+        }
+      }
+
+      // Skip ST routing for assistant messages (already in PG via sync above)
+      if (role === 'assistant') continue;
 
       // Route message to the correct bot(s) by wechat_id
       const targetBotIds = wechatIdToBotIds.get(wechatId);
@@ -603,6 +626,76 @@ async function sendViaILink(botMapping, msg) {
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// World Book Auto-Linker (merged from st-worldbook-autolink.js)
+// ---------------------------------------------------------------------------
+
+/**
+ * Watch ST chat directory and auto-link world books for new conversations.
+ */
+function startWorldBookWatcher() {
+  const fs = require('fs');
+  const path = require('path');
+  const ST_DATA_DIR = process.env.ST_DATA_DIR || path.join(__dirname, '..', 'st-data');
+  const POLL_MS = parseInt(process.env.WORLDBOOK_POLL_INTERVAL || '3000', 10);
+  const seenFiles = new Set();
+
+  function scan() {
+    try {
+      const defaultDir = path.join(ST_DATA_DIR, '24926e2e3aa4-im-bot', 'data', 'default-user');
+      const worldsDir = path.join(defaultDir, 'worlds');
+      const chatsDir = path.join(defaultDir, 'chats');
+
+      if (!fs.existsSync(worldsDir) || !fs.existsSync(chatsDir)) return;
+
+      const worldBooks = fs.readdirSync(worldsDir)
+        .filter(f => f.endsWith('.json'))
+        .map(f => f.replace('.json', ''));
+
+      if (worldBooks.length === 0) return;
+
+      const charDirs = fs.readdirSync(chatsDir, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name);
+
+      for (const charName of charDirs) {
+        if (!worldBooks.includes(charName)) continue;
+        const charChatDir = path.join(chatsDir, charName);
+        if (!fs.existsSync(charChatDir)) continue;
+
+        const files = fs.readdirSync(charChatDir).filter(f => f.endsWith('.jsonl'));
+
+        for (const f of files) {
+          const fullPath = path.join(charChatDir, f);
+          if (seenFiles.has(fullPath)) continue;
+          seenFiles.add(fullPath);
+
+          try {
+            const content = fs.readFileSync(fullPath, 'utf-8');
+            const firstNewline = content.indexOf('\\n');
+            if (firstNewline < 0) continue;
+            const meta = JSON.parse(content.substring(0, firstNewline));
+
+            if (!meta.chat_metadata?.world_info) {
+              meta.chat_metadata = meta.chat_metadata || {};
+              meta.chat_metadata.world_info = charName;
+              const newFirstLine = JSON.stringify(meta);
+              const rest = content.substring(content.indexOf('\\n') + 1);
+              fs.writeFileSync(fullPath, newFirstLine + '\\n' + rest, 'utf-8');
+              console.log(`[WorldBook] ✅ Auto-linked "\${charName}" → ${f}`);
+            }
+          } catch { /* skip corrupted */ }
+        }
+      }
+    } catch { /* dirs may not exist yet */ }
+  }
+
+  scan();
+  setInterval(scan, POLL_MS);
+  console.log(`[WorldBook] Watcher started (poll: ${POLL_MS}ms)`);
+}
+
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
@@ -656,7 +749,7 @@ async function main() {
 
   console.log('');
   console.log('='.repeat(60));
-  console.log('  Hermes ↔ SillyTavern Relay');
+  console.log('  Hermes ↔ SillyTavern Relay + Sync + WorldBook (merged)');
   console.log('='.repeat(60));
   console.log(`  Hermes DB:     ${HERMES_DB}`);
   console.log(`  PostgreSQL:    ${PG_URL.replace(/\/\/.*@/, '//***@')}`);
@@ -708,6 +801,11 @@ async function main() {
 
   // Start WebSocket server for ST ChatBridge clients
   startWSServer();
+
+  // Start World Book Auto-Linker (monitors ST chat files)
+  if (!isOnce) {
+    startWorldBookWatcher();
+  }
 
   // Periodic mapping refresh
   if (!isOnce) {
