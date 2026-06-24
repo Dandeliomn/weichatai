@@ -264,6 +264,134 @@ function applyPersonaFeedback(feedback) {
 }
 
 // =============================================================================
+// AI Judge — 每轮对话后判断是否需要调整人格参数
+// =============================================================================
+
+const JUDGE_ENABLED = true;           // 开关
+const JUDGE_INTERVAL = 5;            // 每 N 轮对话判定一次（节省 API 调用）
+let judgeCounter = 0;
+
+/**
+ * 调用 DeepSeek API (deepseek-v4-flash, 推理关闭) 判断是否需要调整人格参数
+ *
+ * @param {string} userMsg 用户消息
+ * @param {string} botReply 机器人回复
+ * @param {object} parameters 当前人格参数
+ * @returns {{ adjust: boolean, param?: string, delta?: number, reason?: string } | null}
+ */
+function callJudgeAPI(userMsg, botReply, parameters) {
+  return new Promise((resolve) => {
+    const judgePrompt = `你是一个角色扮演质量评估器。根据用户消息和角色回复，判断角色的人格参数是否需要调整。
+
+当前参数（0=最低, 1=最高）：
+- talkativeness(话多程度): ${parameters.talkativeness}
+- warmth(热情程度): ${parameters.warmth}
+- reply_length(回复长度): ${parameters.reply_length}
+- playfulness(俏皮程度): ${parameters.playfulness}
+- patience(耐心程度): ${parameters.patience}
+- affection(亲密程度): ${parameters.affection}
+
+用户消息: "${userMsg.substring(0, 200)}"
+角色回复: "${botReply.substring(0, 300)}"
+
+判断标准：
+- 如果回复明显偏离用户期望（太热情/太冷淡/太长/太短/太皮/太严肃等），返回 adjust:true
+- 如果回复自然合理，返回 adjust:false
+- 每次只调整一个参数，delta 绝对值 0.1-0.2
+- 不要过于敏感，只有明显不匹配时才调整
+
+只返回 JSON，不要其他文字：
+{"adjust": false}
+或
+{"adjust": true, "param": "warmth", "delta": -0.1, "reason": "用户说别这么热但回复很热情"}`;
+
+    const body = JSON.stringify({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: judgePrompt }],
+      max_tokens: 150,
+      temperature: 0,
+      stream: false,
+      reasoning_effort: 'low',  // 低推理模式
+    });
+
+    const https = require('https');
+    const buf = Buffer.from(body);
+    const options = {
+      hostname: 'api.deepseek.com',
+      path: '/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY || ''}`,
+        'Content-Length': buf.length,
+      },
+      timeout: 10000,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (c) => data += c);
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          const content = j.choices?.[0]?.message?.content || '';
+          // 提取 JSON
+          const match = content.match(/\{[\s\S]*\}/);
+          if (match) {
+            const result = JSON.parse(match[0]);
+            resolve(result);
+          } else {
+            resolve(null);
+          }
+        } catch (e) {
+          resolve(null);
+        }
+      });
+      res.on('error', () => resolve(null));
+    });
+
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.write(buf);
+    req.end();
+  });
+}
+
+/**
+ * AI Judge 入口：判断并应用参数调整
+ */
+async function runAIGudge(userMsg, botReply) {
+  if (!JUDGE_ENABLED) return;
+  judgeCounter++;
+  if (judgeCounter % JUDGE_INTERVAL !== 0) return;
+
+  try {
+    // 读取当前参数
+    let parameters = { ...DEFAULT_PARAMETERS };
+    if (fs.existsSync(CONFIG.PERSONA_PATH)) {
+      const data = JSON.parse(fs.readFileSync(CONFIG.PERSONA_PATH, 'utf8'));
+      if (data.parameters) parameters = data.parameters;
+    }
+
+    log(`🧠 AI Judge 评估中...`);
+    const result = await callJudgeAPI(userMsg, botReply, parameters);
+
+    if (result && result.adjust && result.param) {
+      const feedback = { parameter: result.param, delta: result.delta || 0 };
+      const success = applyPersonaFeedback(feedback);
+      if (success) {
+        personaCache = null; // 强制下次重新加载
+        log(`🎭 AI Judge: ${result.param} ${feedback.delta > 0 ? '+' : ''}${feedback.delta} — ${result.reason || ''}`);
+      }
+    } else {
+      log(`🧠 AI Judge: 无需调整`);
+    }
+  } catch (e) {
+    // Judge 失败不阻塞主流程
+  }
+}
+
+// =============================================================================
 // 人格加载
 // =============================================================================
 
@@ -918,6 +1046,9 @@ async function processMessage(msg) {
 
     // 5. 同步到 PostgreSQL (记录日志)
     await syncToPG(conversationId, fromUser, userContent, reply);
+
+    // 6. AI Judge 评估（异步，不阻塞）
+    runAIGudge(userContent, reply).catch(() => {});
 
     log(`✅ 消息 #${msg.id} 处理完成`);
   } catch (e) {
