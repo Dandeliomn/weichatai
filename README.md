@@ -7,13 +7,13 @@
 ```
 微信 ←→ iLink API ←→ 宿主机 Hermes Gateway (消息收发)
                               ↕
-                    hermes-st-relay (WebSocket 路由)
+              hermes-st-relay (WebSocket 路由 + 同步 + 世界书)
                               ↕
                     SillyTavern × N (角色引擎)
                               ↕
                          DeepSeek API
                               ↕
-                    Docker PostgreSQL + Redis + MinIO
+              Docker PostgreSQL + Redis (MinIO 已移除，使用本地文件)
                               ↕
                     Docker Dashboard (BridgePage)
                               ↕
@@ -26,15 +26,14 @@
 | 组件 | 位置 | 作用 |
 |------|------|------|
 | **Hermes Gateway** | systemd | 微信消息收发 |
-| **hermes-st-relay** | systemd | Hermes → ST WebSocket 消息路由 + 记忆纠正检测 + 关系分析触发 |
-| **hermes-sync** | systemd | 对话同步到 PostgreSQL |
-| **hermes-st-worldbook** | systemd | ST 世界书自动挂载 (新聊天→自动绑定角色记忆) |
+| **hermes-st-relay** (合并版) | systemd | 消息路由 + 对话同步 + 世界书挂载 + 记忆纠正检测 + 关系分析触发 |
 | **SillyTavern** | Docker (per-bot) | 角色引擎 — 角色卡 + 世界书 + ChatBridge 扩展 |
 | **api-server** | Docker | REST API + Webhook |
 | **Dashboard** | Docker + Nginx | Web 管理界面 (BridgePage, 角色管理) |
-| **PostgreSQL** | Docker | 对话记录 (12,117条), 用户数据, 纠正日志 |
+| **PostgreSQL** | Docker | 对话记录, 用户数据, 纠正日志, 记忆存储 |
 | **Redis** | Docker | 缓存 + BullMQ 队列 |
-| **MinIO** | Docker | 文件存储 |
+
+> 废弃服务: `hermes-sync`, `hermes-st-worldbook` 已合并到 relay；`MinIO` 已移除（代码自动回退本地文件系统）
 
 ## 双 Skill 体系
 
@@ -51,20 +50,18 @@
 # Docker 管理后台
 docker compose up -d
 
-# AI 引擎
+# AI 引擎（仅需 2 个 systemd 服务）
 systemctl --user start hermes-gateway
 systemctl --user start hermes-st-relay
-systemctl --user start hermes-sync
-systemctl --user start hermes-st-worldbook
 ```
 
 ### 2. 访问
 
 | 地址 | 用途 |
 |------|------|
+| `http://localhost:3000` | API 服务 (健康检查 /health) |
 | `http://localhost:8080` | Dashboard + BridgePage |
 | `http://localhost:8082` | SillyTavern Web UI |
-| `http://localhost:8080/health` | 健康检查 |
 
 ### 3. 使用 Skill
 
@@ -114,15 +111,15 @@ curl GET /api/memory/corrections
 ├── dashboard/                  # React 前端 (Vite + Ant Design)
 │   └── src/pages/BridgePage.tsx
 ├── scripts/                    # 核心脚本
-│   ├── hermes-st-relay.js      # ★ 消息中继 (WebSocket 路由 + 纠正/分析检测)
+│   ├── hermes-st-relay.js      # ★ 消息中继 + 同步 + 世界书 (合并版)
 │   ├── memory-correct.js       # ★ 记忆自进化引擎
 │   ├── love-analysis.js        # ★ she-love-me PG适配器
-│   ├── st-worldbook-autolink.js # ★ 世界书自动挂载
 │   ├── generate-st-compose.js  # ST 容器编排生成
 │   ├── convert-to-st-charcard.ts # PG角色→ST角色卡
-│   ├── sync-hermes-conversations.js # Hermes SQLite→PG
 │   ├── init-db-v1~v7.sql       # 数据库迁移
 │   └── analyze-wangjing.js     # 聊天数据分析
+│   ├── sync-hermes-conversations.js # [DEPRECATED] 已合并到 relay
+│   └── st-worldbook-autolink.js     # [DEPRECATED] 已合并到 relay
 ├── exes/                       # create-ex Skill 输出
 │   └── 静静/
 │       ├── persona.md          # 5层人格模型
@@ -134,8 +131,9 @@ curl GET /api/memory/corrections
 │   └── 24926e2e3aa4-im-bot/   # Bot 运行数据
 ├── docker-compose.yml
 ├── docker-compose.st.yml       # ST 容器编排
-├── nginx.conf                  # Nginx (Dashboard + ST 独立端口)
+├── nginx.conf                  # Nginx 配置 (可选)
 └── docs/
+    ├── CHANGELOG.md
     ├── changelogs/
     └── superpowers/
 ```
@@ -175,7 +173,7 @@ docker compose restart api-server           # 重启 API (代码更新后)
 
 # 服务管理
 systemctl --user status hermes-gateway      # AI 引擎
-systemctl --user restart hermes-st-relay    # 重启中继
+systemctl --user restart hermes-st-relay    # 重启中继 (含同步+世界书)
 journalctl --user -u hermes-st-relay -f     # 中继日志
 
 # 记忆纠正 (CLI)
@@ -188,3 +186,12 @@ node scripts/love-analysis.js -c 静静
 # 数据库
 docker exec weclaw-postgres psql -U weclaw -d weclaw_companion
 ```
+
+## 安全说明
+
+> ⚠️ 2026-06-24 安全审计修复：
+> - `.env` 文件已清除真实凭据并替换为模板
+> - SQL 注入已修复（参数化查询替代字符串拼接）
+> - 中间件执行顺序已修正
+> - Docker 套接字挂载已添加安全警告
+> - 建议运行 `git filter-repo --path .env --invert-paths` 彻底清除 git 历史中的凭据
