@@ -98,6 +98,32 @@ curl -X POST /api/memory/analyze  -d '{"character":"静静"}'
 curl GET /api/memory/corrections
 ```
 
+
+## 第三方技能市场
+
+项目集成了社区开源的 Hermes Agent 技能，存放在 \endor/\ 目录。
+
+| 技能 | 来源 | 用途 | 安装 |
+|------|------|------|------|
+| **SoulCraft** | [Losii-L/SoulCraft](https://github.com/Losii-L/SoulCraft) | 人格蒸馏（全量/标准/轻量三级） | \ash scripts/install-skills.sh\ |
+| **hersona** | [shiro-0x/hersona](https://github.com/shiro-0x/hersona) | 84 个人格属性模板（性格/说话/原型/外观/爱好） | 同上 |
+
+### 快速安装
+
+\\\ash
+# 安装所有技能
+bash scripts/install-skills.sh
+
+# 查看即将安装的内容（不实际执行）
+bash scripts/install-skills.sh --dry-run
+\\\
+
+### 使用方式
+
+| 技能 | 触发方式 |
+|------|---------|
+| SoulCraft distill | 微信说"蒸馏静静" → 自动从聊天记录生成人格 |
+| hersona | 微信说\/hersona personality/tsundere\ → 切换傲娇模式 |
 ## 项目结构
 
 ```
