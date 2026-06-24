@@ -21,7 +21,8 @@ services:
       - .env
     environment:
       - NODE_ENV=production
-    volumes:
+    volumes:  # minio_data:
+  #   driver: local
   # minio_data:
   #   driver: local
       - api_data:/app/data
