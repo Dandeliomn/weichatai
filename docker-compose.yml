@@ -111,10 +111,6 @@ services:
       retries: 5
       start_period: 30s
 
-  # ===========================================================================
-  # MinIO - 对象存储 (可选，用于文件持久化)
-  # 如果不需要OSS，可以注释掉此服务
-  # ===========================================================================
   minio:
     image: minio/minio:latest
     container_name: weclaw-minio
@@ -210,8 +206,6 @@ volumes:
   api_data:
     driver: local
   uploads_data:
-    driver: local
-  minio_data:
     driver: local
 
 # =============================================================================
