@@ -109,7 +109,8 @@ function initDB() {
 async function loadCursor() {
   try {
     const { rows } = await pgPool.query(
-      `SELECT value FROM system_config WHERE key = '${CURSOR_CONFIG_KEY}'`
+      `SELECT value FROM system_config WHERE key = $1`,
+      [CURSOR_CONFIG_KEY]
     );
     cursor = parseInt(rows[0]?.value || '0', 10);
     console.log(`[Relay] Cursor loaded: ${cursor}`);
@@ -125,9 +126,9 @@ async function loadCursor() {
 async function saveCursor(newCursor) {
   try {
     await pgPool.query(
-      `INSERT INTO system_config (key, value) VALUES ('${CURSOR_CONFIG_KEY}', $1)
-       ON CONFLICT (key) DO UPDATE SET value = $1`,
-      [String(newCursor)]
+      `INSERT INTO system_config (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = $2`,
+      [CURSOR_CONFIG_KEY, String(newCursor)]
     );
   } catch (e) {
     console.error(`[Relay] Failed to save cursor ${newCursor}:`, e.message);
