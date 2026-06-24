@@ -28,6 +28,7 @@
  *   HERMES_BOT_ID         Pin to a specific bot_id (optional, for multi-bot setups)
  */
 
+const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
@@ -63,6 +64,10 @@ const MAPPING_REFRESH_MS = parseInt(process.env.MAPPING_REFRESH || '30000', 10);
 const ILINK_BASE_URL = process.env.ILINK_BASE_URL || 'https://ilinkai.weixin.qq.com';
 const PINNED_BOT_ID = process.env.HERMES_BOT_ID || null;
 const CURSOR_CONFIG_KEY = 'hermes_st_relay_cursor';
+const ACTIVE_PERSONA_FILE = process.env.ACTIVE_PERSONA_FILE || path.join(os.homedir(), '.hermes', 'active_persona.json');
+const HERSONA_ATTR_DIR = process.env.HERSONA_ATTR_DIR || path.join(__dirname, '..', 'vendor', 'hersona', 'attributes');
+const PERSONA_CACHE_TTL = parseInt(process.env.PERSONA_CACHE_TTL || '30000', 10);
+
 
 // ---------------------------------------------------------------------------
 // State
@@ -81,6 +86,78 @@ const botStMap = new Map();
 
 // wechat_id → bot_id[] lookup for message routing
 const wechatIdToBotIds = new Map();
+// --- Persona state for rich protocol ---
+let personaCache = { prompt: null, ts: 0 };
+
+/**
+ * Load active personality context from hersona attributes.
+ * Caches for PERSONA_CACHE_TTL ms to avoid disk I/O on every poll.
+ * Returns a system prompt string or null if no active persona.
+ */
+function loadActivePersona() {
+  const now = Date.now();
+  if (now - personaCache.ts < PERSONA_CACHE_TTL) return personaCache.prompt;
+
+  personaCache.ts = now;
+
+  try {
+    // 1. Read active persona file (written by scripts/set-persona.js or Hermes hook)
+    let activeAttrs = null;
+    if (fs.existsSync(ACTIVE_PERSONA_FILE)) {
+      const raw = fs.readFileSync(ACTIVE_PERSONA_FILE, 'utf-8');
+      activeAttrs = JSON.parse(raw).attributes;
+    }
+
+    if (!activeAttrs || activeAttrs.length === 0) {
+      personaCache.prompt = null;
+      return null;
+    }
+
+    // 2. Read each attribute YAML and build prompt
+    const parts = [];
+    for (const attr of activeAttrs) {
+      const yamlPath = path.join(HERSONA_ATTR_DIR, attr.category, attr.name + '.yaml');
+      if (!fs.existsSync(yamlPath)) continue;
+
+      const yaml = fs.readFileSync(yamlPath, 'utf-8');
+      const desc = extractYamlValue(yaml, 'description');
+      const displayName = extractYamlValue(yaml, 'display_name') || attr.name;
+
+      if (desc) {
+        parts.push(`[${displayName}] ${desc}`);
+      }
+    }
+
+    if (parts.length === 0) {
+      personaCache.prompt = null;
+      return null;
+    }
+
+    personaCache.prompt = parts.join('\n');
+    console.log(`[Persona] Loaded: ${activeAttrs.map(a => a.name).join(', ')}`);
+    return personaCache.prompt;
+  } catch (e) {
+    personaCache.prompt = null;
+    return null;
+  }
+}
+
+/**
+ * Simple YAML value extractor (no parser dependency).
+ * Extracts the value of a top-level scalar key.
+ */
+function extractYamlValue(yaml, key) {
+  const regex = new RegExp(`^${key}:\s*(.+)`, 'm');
+  const match = yaml.match(regex);
+  if (!match) return null;
+  let val = match[1].trim();
+  // Remove surrounding quotes if present
+  if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+    val = val.slice(1, -1);
+  }
+  return val;
+}
+
 
 // ---------------------------------------------------------------------------
 // Database helpers
@@ -521,15 +598,19 @@ async function pollMessages() {
         // Route message to connected ST client (by wechat_id)
         const stClient = stClients.get(wechatId);
         if (stClient && stClient.ws.readyState === WebSocket.OPEN) {
+          // Inject active personality context (rich protocol)
+          const personaPrompt = loadActivePersona();
+          const messages = [];
+          if (personaPrompt) {
+            messages.push({ role: 'system', content: personaPrompt });
+          }
+          messages.push({ role: 'user', content: content });
+
           const payload = {
             type: 'user_request',
             user_id: wechatId,
             bot_id: stClient.botId,
-            content: {
-              messages: [
-                { role: 'user', content: content }
-              ]
-            },
+            content: { messages },
             timestamp: Math.floor(timestamp),
           };
           stClient.ws.send(JSON.stringify(payload));
