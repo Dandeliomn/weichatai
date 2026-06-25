@@ -333,7 +333,7 @@ function syncSOUL(parameters, catchphrases) {
 
 const JUDGE_ENABLED = true;            // 开关
 const JUDGE_ROUNDS = 5;                  // 每 5 条消息评估一次（省 token）
-let judgeCounter = 0;                    // 消息计数
+let judgeCounter = 0;                    // 全局消息计数（relay 串行处理，安全）
 
 /**
  * 调用 DeepSeek API (deepseek-v4-flash, 推理关闭) 判断是否需要调整人格参数
@@ -372,7 +372,7 @@ function callJudgeAPI(userMsg, botReply, parameters) {
     const body = JSON.stringify({
       model: 'deepseek-v4-flash',
       messages: [{ role: 'user', content: judgePrompt }],
-      max_tokens: 100,  // 仅需判断/调整，不用太多 token
+      max_tokens: 200,  // JSON + 中文 reason
       temperature: 0,
       stream: false,
     });
