@@ -332,9 +332,8 @@ function syncSOUL(parameters, catchphrases) {
 // =============================================================================
 
 const JUDGE_ENABLED = true;            // 开关
-const JUDGE_INTERVAL_MS = 10 * 60 * 1000; // 定时循环：每 10 分钟扫描一次
-let judgeTimer = null;
-let lastJudgeTime = 0;
+const JUDGE_ROUNDS = 5;                  // 每 5 条消息评估一次（省 token）
+let judgeCounter = 0;                    // 消息计数
 
 /**
  * 调用 DeepSeek API (deepseek-v4-flash, 推理关闭) 判断是否需要调整人格参数
@@ -373,10 +372,9 @@ function callJudgeAPI(userMsg, botReply, parameters) {
     const body = JSON.stringify({
       model: 'deepseek-v4-flash',
       messages: [{ role: 'user', content: judgePrompt }],
-      max_tokens: 150,
+      max_tokens: 100,  // 仅需判断/调整，不用太多 token
       temperature: 0,
       stream: false,
-      reasoning_effort: 'low',  // 低推理模式
     });
 
     const https = require('https');
@@ -428,7 +426,7 @@ function callJudgeAPI(userMsg, botReply, parameters) {
 async function runAIGudge(userMsg, botReply) {
   if (!JUDGE_ENABLED) return;
   judgeCounter++;
-  if (judgeCounter % JUDGE_INTERVAL !== 0) return;
+  if (judgeCounter % JUDGE_ROUNDS !== 0) return;
 
   try {
     // 读取当前参数
